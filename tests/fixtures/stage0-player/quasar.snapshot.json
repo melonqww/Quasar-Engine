@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "scene": {
+    "name": "Stage 0 Room",
+    "objects": [
+      { "id": "floor", "kind": "floor", "position": [0.0, -0.03, 0.0], "scale": [1.0, 1.0, 1.0] },
+      { "id": "wall", "kind": "wall", "position": [0.0, 1.55, -3.0], "scale": [1.0, 1.0, 1.0] },
+      { "id": "door", "kind": "door", "position": [1.35, 1.02, -2.82], "scale": [1.0, 1.0, 1.0] },
+      { "id": "character", "kind": "character", "position": [-1.35, 1.12, 1.8], "scale": [1.0, 1.0, 1.0] },
+      { "id": "prop", "kind": "prop", "position": [0.0, 0.72, 0.0], "scale": [1.35, 1.35, 1.35] }
+    ],
+    "prop_model": "Quasar/viewport-prop.glb",
+    "ambience_audio": "Quasar/audio/room-ambience.wav",
+    "door_audio": "Quasar/audio/door-latch.wav",
+    "door_script": "scripts/door.lua"
+  },
+  "assets_directory": "assets"
+}

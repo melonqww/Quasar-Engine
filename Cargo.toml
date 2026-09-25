@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/quasar-project",
+    "crates/quasar-runtime",
+    "crates/quasar-editor",
+    "crates/quasar-player",
+]
+default-members = [
+    "crates/quasar-project",
+    "crates/quasar-runtime",
+    "crates/quasar-editor",
+    "crates/quasar-player",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+bevy = { version = "=0.19.1", features = ["wav"] }
+bevy_egui = "=0.42.0"
+bevy_rapier3d = "=0.36.0"
+mlua = { version = "=0.12.1", features = ["lua54", "vendored"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+quasar-project = { path = "crates/quasar-project" }
+quasar-runtime = { path = "crates/quasar-runtime" }

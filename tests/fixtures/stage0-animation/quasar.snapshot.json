@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "scene": {
+    "name": "Stage 0 Animation Probe",
+    "objects": [
+      { "id": "floor", "kind": "floor", "position": [0.0, -0.03, 0.0], "scale": [1.0, 1.0, 1.0] },
+      { "id": "wall", "kind": "wall", "position": [0.0, 1.55, -3.0], "scale": [1.0, 1.0, 1.0] },
+      { "id": "door", "kind": "door", "position": [1.35, 1.02, -2.82], "scale": [1.0, 1.0, 1.0] },
+      { "id": "character", "kind": "character", "position": [-1.35, 1.12, 1.8], "scale": [1.0, 1.0, 1.0] },
+      { "id": "prop", "kind": "prop", "position": [0.0, 0.72, 0.0], "scale": [1.35, 1.35, 1.35] }
+    ],
+    "prop_model": "Quasar/viewport-prop.glb",
+    "ambience_audio": "Quasar/audio/room-ambience.wav",
+    "door_audio": "Quasar/audio/door-latch.wav",
+    "door_script": "scripts/door.lua",
+    "animation": {
+      "assets": [
+        { "id": "robot_expressive", "kind": "model", "path": "Quasar/RobotExpressive.glb" },
+        { "id": "door_latch", "kind": "audio", "path": "Quasar/audio/door-latch.wav" }
+      ],
+      "object_clips": [
+        {
+          "id": "door_open",
+          "object_id": "door",
+          "duration_seconds": 0.75,
+          "tracks": [
+            {
+              "property": "translation",
+              "interpolation": "smooth_step",
+              "keys": [
+                { "time_seconds": 0.0, "value": { "type": "vec3", "components": [1.35, 1.02, -2.82] } },
+                { "time_seconds": 0.75, "value": { "type": "vec3", "components": [1.8, 1.02, -2.82] } }
+              ]
+            },
+            {
+              "property": "rotation",
+              "interpolation": "smooth_step",
+              "keys": [
+                { "time_seconds": 0.0, "value": { "type": "quaternion", "components": [0.0, 0.0, 0.0, 1.0] } },
+                { "time_seconds": 0.75, "value": { "type": "quaternion", "components": [0.0, 0.5850973, 0.0, 0.8109631] } }
+              ]
+            }
+          ],
+          "events": [
+            { "id": "door_latch_at_open", "time_seconds": 0.12, "type": "play_sound", "asset_id": "door_latch" }
+          ]
+        }
+      ],
+      "imported_bindings": [
+        {
+          "object_id": "character",
+          "asset_id": "robot_expressive",
+          "clips": [
+            { "source_clip_id": "Idle", "display_name": "Idle" },
+            { "source_clip_id": "Walking", "display_name": "Walk" }
+          ]
+        }
+      ]
+    }
+  },
+  "assets_directory": "assets"
+}

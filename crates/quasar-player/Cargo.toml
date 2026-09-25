@@ -1,0 +1,13 @@
+[package]
+name = "quasar-player"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy.workspace = true
+bevy_rapier3d.workspace = true
+quasar-project.workspace = true
+quasar-runtime.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
