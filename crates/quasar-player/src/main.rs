@@ -17,8 +17,13 @@ use bevy_rapier3d::prelude::{
     CharacterAutostep, CharacterLength, Collider, KinematicCharacterController, NoUserData,
     RapierPhysicsPlugin, TimestepMode,
 };
+use quasar_project::document::{ObjectId, ProjectDocument, SceneDocument};
 use quasar_project::{ProjectSnapshot, SceneSnapshot, SnapshotObject, SnapshotObjectKind};
 use quasar_runtime::{
+    animation::{
+        AnimationProbeData, AnimationProbePlugin, AnimationSessionAudio, AnimationWorkspaceState,
+        SnapshotObjectId, stage0_character_model_transform,
+    },
     gameplay::{GameplayCommand, run_door_interaction},
     physics::{CharacterController, CharacterControllerInput},
 };
@@ -42,6 +47,17 @@ struct ResolvedSnapshot {
     door_script: String,
 }
 
+#[derive(Clone, Debug, Resource)]
+struct ResolvedDocument {
+    project_path: PathBuf,
+    document: ProjectDocument,
+}
+
+#[derive(Clone, Copy, Component)]
+struct DocumentObjectId {
+    _id: ObjectId,
+}
+
 #[derive(Component)]
 struct PlayerDoor;
 
@@ -56,7 +72,7 @@ type PlayerSessionAudioQuery<'w, 's> = Query<
         Option<&'static AudioSink>,
         Option<&'static SpatialAudioSink>,
     ),
-    With<PlayerSessionAudio>,
+    Or<(With<PlayerSessionAudio>, With<AnimationSessionAudio>)>,
 >;
 
 #[derive(Resource, Default)]
@@ -89,10 +105,27 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    if let Some(document_path) = parse_project_document_argument(&args)? {
+        let document = resolve_project_document(&document_path)?;
+        let screenshot = parse_screenshot_argument(&args)?;
+        if args.iter().any(|argument| argument == "--validate-only") {
+            let scene = active_document_scene(&document.document)?;
+            println!(
+                "Project document valid: project='{}', scene='{}', objects={}",
+                document.document.name,
+                scene.name,
+                scene.objects.len()
+            );
+            return Ok(());
+        }
+        return launch_document_preview(document, screenshot);
+    }
+
     let snapshot_arg = parse_snapshot_argument(&args)?;
     let screenshot = parse_screenshot_argument(&args)?;
     let snapshot = resolve_snapshot(&snapshot_arg)?;
     let benchmark = args.iter().any(|argument| argument == "--benchmark-60s");
+    let animation_smoke = args.iter().any(|argument| argument == "--animation-smoke");
     if args.iter().any(|argument| argument == "--validate-only") {
         println!(
             "Snapshot valid: scene='{}', assets='{}'",
@@ -108,7 +141,141 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    launch_player(snapshot, benchmark, screenshot)
+    launch_player(snapshot, benchmark, screenshot, animation_smoke)
+}
+
+fn parse_project_document_argument(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut document = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--project-document" {
+            if document.is_some() {
+                return Err("--project-document may be supplied only once".to_owned());
+            }
+            index += 1;
+            document =
+                Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                    "--project-document requires a path".to_owned()
+                })?));
+        }
+        index += 1;
+    }
+    Ok(document)
+}
+
+fn resolve_project_document(path: &Path) -> Result<ResolvedDocument, String> {
+    let project_path = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot resolve project document {}: {error}",
+            path.display()
+        )
+    })?;
+    let document = ProjectDocument::load(&project_path)?;
+    Ok(ResolvedDocument {
+        project_path,
+        document,
+    })
+}
+
+fn active_document_scene(document: &ProjectDocument) -> Result<&SceneDocument, String> {
+    document
+        .scenes
+        .iter()
+        .find(|scene| scene.id == document.active_scene_id)
+        .ok_or_else(|| "active scene is missing from the project document".to_owned())
+}
+
+fn launch_document_preview(
+    document: ResolvedDocument,
+    screenshot: Option<String>,
+) -> Result<(), String> {
+    let scene = active_document_scene(&document.document)?;
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: format!("{} — Quasar Player Preview", document.document.name),
+            name: Some("quasar.player.document_preview".to_owned()),
+            resolution: (1280, 800).into(),
+            resizable: true,
+            ..default()
+        }),
+        ..default()
+    }))
+    .insert_resource(document.clone())
+    .add_systems(Startup, setup_document_preview);
+    if let Some(path) = screenshot {
+        app.insert_resource(ScreenshotRequest(path))
+            .add_systems(Update, capture_screenshot_after_render_warmup);
+    }
+    info!(
+        project = %document.project_path.display(),
+        scene = %scene.name,
+        "Standalone Player opened a Stage 1 document preview"
+    );
+    app.run();
+    Ok(())
+}
+
+fn setup_document_preview(
+    mut commands: Commands,
+    document: Res<ResolvedDocument>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(5.0, 4.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 10_000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.6, 0.0)),
+    ));
+    let Ok(scene) = active_document_scene(&document.document) else {
+        return;
+    };
+    let mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.36, 0.58, 0.76),
+        perceptual_roughness: 0.78,
+        ..default()
+    });
+    let entities = scene
+        .objects
+        .iter()
+        .map(|object| (object.id, commands.spawn_empty().id()))
+        .collect::<std::collections::HashMap<_, _>>();
+    for object in &scene.objects {
+        let Some(&entity) = entities.get(&object.id) else {
+            continue;
+        };
+        let transform = Transform {
+            translation: Vec3::from_array(object.local_transform.translation),
+            rotation: Quat::from_xyzw(
+                object.local_transform.rotation_xyzw[0],
+                object.local_transform.rotation_xyzw[1],
+                object.local_transform.rotation_xyzw[2],
+                object.local_transform.rotation_xyzw[3],
+            ),
+            scale: Vec3::from_array(object.local_transform.scale),
+        };
+        let mut entity_commands = commands.entity(entity);
+        entity_commands.insert((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            transform,
+            Name::new(object.name.clone()),
+            DocumentObjectId { _id: object.id },
+        ));
+        if let Some(parent_id) = object.parent_id
+            && let Some(&parent) = entities.get(&parent_id)
+        {
+            entity_commands.insert(ChildOf(parent));
+        }
+    }
 }
 
 fn parse_snapshot_argument(args: &[String]) -> Result<PathBuf, String> {
@@ -132,6 +299,7 @@ fn parse_snapshot_argument(args: &[String]) -> Result<PathBuf, String> {
         } else if args[index] != "--validate-only"
             && args[index] != "--run-interaction"
             && args[index] != "--benchmark-60s"
+            && args[index] != "--animation-smoke"
         {
             return Err(format!("unknown argument: {}", args[index]));
         }
@@ -242,6 +410,7 @@ fn launch_player(
     snapshot: ResolvedSnapshot,
     benchmark: bool,
     screenshot: Option<String>,
+    animation_smoke: bool,
 ) -> Result<(), String> {
     let asset_root = snapshot
         .asset_root
@@ -249,6 +418,9 @@ fn launch_player(
         .ok_or_else(|| "assets directory path is not valid UTF-8".to_owned())?
         .to_owned();
     let mut app = App::new();
+    let animation_data = AnimationProbeData {
+        animation: snapshot.scene.animation.clone(),
+    };
     let window_resolution = if benchmark { (1920, 1080) } else { (1280, 800) };
     app.add_plugins(
         DefaultPlugins
@@ -272,9 +444,11 @@ fn launch_player(
         substeps: 1,
     })
     .insert_resource(snapshot)
+    .insert_resource(animation_data)
     .init_resource::<PlayerSessionState>()
     .add_plugins(RapierPhysicsPlugin::<NoUserData>::default().in_fixed_schedule())
     .add_plugins(quasar_runtime::physics::CharacterControllerPlugin)
+    .add_plugins(AnimationProbePlugin)
     .add_systems(Startup, setup_player_scene)
     .add_systems(
         PreUpdate,
@@ -290,8 +464,25 @@ fn launch_player(
         app.insert_resource(ScreenshotRequest(path))
             .add_systems(Update, capture_screenshot_after_render_warmup);
     }
+    if animation_smoke {
+        app.add_systems(Startup, start_animation_smoke.after(setup_player_scene))
+            .add_systems(
+                PreUpdate,
+                keep_smoke_character_walking.after(collect_player_input),
+            );
+    }
     app.run();
     Ok(())
+}
+
+fn start_animation_smoke(mut animation: ResMut<AnimationWorkspaceState>) {
+    animation.select_character_clip("Walking");
+    animation.play_door_clip();
+    info!("Started Stage 0 animation smoke: door_open + Walking");
+}
+
+fn keep_smoke_character_walking(mut animation: ResMut<AnimationWorkspaceState>) {
+    animation.select_character_clip("Walking");
 }
 
 fn capture_screenshot_after_render_warmup(
@@ -475,36 +666,63 @@ fn spawn_snapshot_object(
                 transform,
                 Collider::cuboid(0.55, 1.05, 0.06),
                 PlayerDoor,
+                SnapshotObjectId(object.id.clone()),
                 name,
             ));
         }
         SnapshotObjectKind::Character => {
-            commands.spawn((
-                Mesh3d(meshes.add(Capsule3d::new(0.35, 1.6))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.16, 0.68, 0.93),
-                    perceptual_roughness: 0.72,
-                    ..default()
-                })),
-                transform,
-                Collider::capsule_y(0.8, 0.35),
-                SpatialListener::new(0.2),
-                KinematicCharacterController {
-                    offset: CharacterLength::Absolute(0.01),
-                    snap_to_ground: Some(CharacterLength::Absolute(0.12)),
-                    autostep: Some(CharacterAutostep {
-                        max_height: CharacterLength::Absolute(0.25),
-                        min_width: CharacterLength::Absolute(0.2),
-                        include_dynamic_bodies: false,
-                    }),
-                    max_slope_climb_angle: 45.0_f32.to_radians(),
-                    min_slope_slide_angle: 30.0_f32.to_radians(),
-                    ..default()
-                },
-                CharacterController::default(),
-                CharacterControllerInput::default(),
-                name,
-            ));
+            let character = commands
+                .spawn((
+                    transform,
+                    Visibility::default(),
+                    Collider::capsule_y(0.8, 0.35),
+                    SpatialListener::new(0.2),
+                    KinematicCharacterController {
+                        offset: CharacterLength::Absolute(0.01),
+                        snap_to_ground: Some(CharacterLength::Absolute(0.12)),
+                        autostep: Some(CharacterAutostep {
+                            max_height: CharacterLength::Absolute(0.25),
+                            min_width: CharacterLength::Absolute(0.2),
+                            include_dynamic_bodies: false,
+                        }),
+                        max_slope_climb_angle: 45.0_f32.to_radians(),
+                        min_slope_slide_angle: 30.0_f32.to_radians(),
+                        ..default()
+                    },
+                    CharacterController::default(),
+                    CharacterControllerInput::default(),
+                    SnapshotObjectId(object.id.clone()),
+                    name,
+                ))
+                .id();
+            let animation_model = snapshot.scene.animation.as_ref().and_then(|animation| {
+                let binding = animation
+                    .imported_bindings
+                    .iter()
+                    .find(|binding| binding.object_id == object.id)?;
+                animation
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == binding.asset_id)
+                    .map(|asset| asset.path.clone())
+            });
+            if let Some(path) = animation_model {
+                commands.spawn((
+                    WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(path))),
+                    stage0_character_model_transform(),
+                    ChildOf(character),
+                    Name::new("Imported Character Model"),
+                ));
+            } else {
+                commands.entity(character).insert((
+                    Mesh3d(meshes.add(Capsule3d::new(0.35, 1.6))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.16, 0.68, 0.93),
+                        perceptual_roughness: 0.72,
+                        ..default()
+                    })),
+                ));
+            }
         }
         SnapshotObjectKind::Prop => {
             commands.spawn((
@@ -523,11 +741,21 @@ fn spawn_snapshot_object(
 fn collect_player_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut character_inputs: Query<&mut CharacterControllerInput>,
+    mut animation_workspace: Option<ResMut<AnimationWorkspaceState>>,
 ) {
     let Ok(mut input) = character_inputs.single_mut() else {
         return;
     };
     *input = read_player_input(&keyboard);
+    if let Some(animation_workspace) = animation_workspace.as_mut() {
+        let source = if input.movement.length_squared() > 0.0 {
+            "Walking"
+        } else {
+            "Idle"
+        };
+        animation_workspace.select_character_clip(source);
+        animation_workspace.character_preview_playing = true;
+    }
 }
 
 fn read_player_input(keyboard: &ButtonInput<KeyCode>) -> CharacterControllerInput {
@@ -553,9 +781,12 @@ fn read_player_input(keyboard: &ButtonInput<KeyCode>) -> CharacterControllerInpu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interact_with_door(
     keyboard: Res<ButtonInput<KeyCode>>,
     snapshot: Res<ResolvedSnapshot>,
+    animation_data: Option<Res<AnimationProbeData>>,
+    mut animation_workspace: Option<ResMut<AnimationWorkspaceState>>,
     asset_server: Res<AssetServer>,
     mut commands: Commands,
     mut state: ResMut<PlayerSessionState>,
@@ -575,12 +806,24 @@ fn interact_with_door(
         match action {
             GameplayCommand::OpenDoor => {
                 if let Ok((entity, mut transform)) = doors.single_mut() {
-                    transform.rotate_y(1.25);
-                    commands.entity(entity).remove::<Collider>();
+                    if snapshot.scene.animation.is_some()
+                        && let Some(workspace) = animation_workspace.as_mut()
+                    {
+                        workspace.play_door_clip();
+                    } else {
+                        transform.rotate_y(1.25);
+                        commands.entity(entity).remove::<Collider>();
+                    }
                     state.door_opened = true;
                 }
             }
             GameplayCommand::PlayDoorSound => {
+                if animation_data
+                    .as_ref()
+                    .is_some_and(|data| data.animation.is_some())
+                {
+                    continue;
+                }
                 commands.spawn((
                     AudioPlayer::new(asset_server.load(&snapshot.scene.door_audio)),
                     PlaybackSettings::DESPAWN

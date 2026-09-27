@@ -1,0 +1,45 @@
+{
+  "format_version": 1,
+  "project_id": "01994800-0000-4000-8000-000000000001",
+  "name": "Stage 1 Document Fixture",
+  "active_scene_id": "01994800-0000-4000-8000-000000000002",
+  "scenes": [
+    {
+      "schema_version": 1,
+      "id": "01994800-0000-4000-8000-000000000002",
+      "name": "Main",
+      "objects": [
+        {
+          "id": "01994800-0000-4000-8000-000000000003",
+          "name": "Room",
+          "parent_id": null,
+          "local_transform": {
+            "translation": [0.0, 0.0, 0.0],
+            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "scale": [1.0, 1.0, 1.0]
+          }
+        },
+        {
+          "id": "01994800-0000-4000-8000-000000000004",
+          "name": "Door",
+          "parent_id": "01994800-0000-4000-8000-000000000003",
+          "local_transform": {
+            "translation": [1.0, 0.0, 0.0],
+            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "scale": [1.0, 2.0, 0.1]
+          },
+          "components": [
+            {
+              "type_id": "quasar.fixture.marker",
+              "schema_version": 1,
+              "data": {
+                "purpose": "roundtrip example",
+                "nested": [1, true, null]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

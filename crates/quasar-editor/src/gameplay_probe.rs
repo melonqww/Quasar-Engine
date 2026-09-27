@@ -4,8 +4,10 @@ use std::{fs, path::Path};
 
 use bevy::{audio::Volume, input::InputSystems, prelude::*};
 use bevy_rapier3d::prelude::Collider;
+use quasar_runtime::animation::{AnimationProbeData, AnimationWorkspaceState};
 use quasar_runtime::gameplay::{GameplayCommand, run_door_interaction};
 
+use super::project_probe::EditorProject;
 use super::{audio_probe::ProbeSessionAudio, viewport_probe::ViewportInputFocus};
 
 const DOOR_SCRIPT_PATH: &str = "../../essentials/scripts/door.lua";
@@ -31,8 +33,17 @@ struct DoorProbeState {
 #[derive(Resource)]
 struct DoorScriptSource(String);
 
-fn load_door_script(mut commands: Commands) {
-    let script_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DOOR_SCRIPT_PATH);
+fn load_door_script(mut commands: Commands, project: Option<Res<EditorProject>>) {
+    let script_path = if let Some(project) = project {
+        project
+            .snapshot_path
+            .parent()
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+            .join(&project.snapshot.assets_directory)
+            .join(&project.snapshot.scene.door_script)
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(DOOR_SCRIPT_PATH)
+    };
     match fs::read_to_string(&script_path) {
         Ok(source) => {
             info!(path = %script_path.display(), "Loaded Lua door probe");
@@ -45,16 +56,29 @@ fn load_door_script(mut commands: Commands) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interact_with_lua_door(
     keyboard: Res<ButtonInput<KeyCode>>,
     focus: Res<ViewportInputFocus>,
     script: Res<DoorScriptSource>,
+    animation_data: Option<Res<AnimationProbeData>>,
+    mut animation_workspace: Option<ResMut<AnimationWorkspaceState>>,
     asset_server: Res<AssetServer>,
     mut commands: Commands,
     mut state: ResMut<DoorProbeState>,
     mut doors: Query<(Entity, &mut Transform), With<ProbeDoor>>,
 ) {
-    if !focus.0 || !keyboard.just_pressed(KeyCode::KeyE) || state.opened {
+    let animation_enabled = animation_data
+        .as_ref()
+        .is_some_and(|data| data.animation.is_some());
+    let already_opened = if animation_enabled {
+        animation_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.door_opened)
+    } else {
+        state.opened
+    };
+    if !focus.0 || !keyboard.just_pressed(KeyCode::KeyE) || already_opened {
         return;
     }
 
@@ -70,13 +94,27 @@ fn interact_with_lua_door(
         match action {
             GameplayCommand::OpenDoor => {
                 if let Ok((entity, mut transform)) = doors.single_mut() {
-                    transform.rotate_y(1.25);
-                    commands.entity(entity).remove::<Collider>();
+                    if animation_data
+                        .as_ref()
+                        .is_some_and(|data| data.animation.is_some())
+                        && let Some(workspace) = animation_workspace.as_mut()
+                    {
+                        workspace.play_door_clip();
+                    } else {
+                        transform.rotate_y(1.25);
+                        commands.entity(entity).remove::<Collider>();
+                    }
                     state.opened = true;
                     info!("Lua interaction opened the probe door");
                 }
             }
             GameplayCommand::PlayDoorSound => {
+                if animation_data
+                    .as_ref()
+                    .is_some_and(|data| data.animation.is_some())
+                {
+                    continue;
+                }
                 commands.spawn((
                     AudioPlayer::new(asset_server.load("Quasar/audio/door-latch.wav")),
                     PlaybackSettings::DESPAWN

@@ -1,5 +1,6 @@
 //! Shared runtime integrations used by the editor and Player.
 
+pub mod animation;
 pub mod gameplay;
 pub mod physics;
 

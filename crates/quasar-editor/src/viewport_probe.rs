@@ -16,7 +16,19 @@ use bevy_egui::{
 use bevy_rapier3d::prelude::{
     CharacterAutostep, CharacterLength, Collider, KinematicCharacterController,
 };
-use quasar_runtime::physics::{CharacterController, CharacterControllerInput};
+use quasar_project::{
+    AnimatedTransformProperty, AnimationKeySnapshot, AnimationValueSnapshot,
+    TransformAnimationTrackSnapshot,
+};
+use quasar_runtime::{
+    animation::{
+        AnimationProbeData, AnimationWorkspaceState, SnapshotObjectId,
+        stage0_character_model_transform,
+    },
+    physics::{CharacterController, CharacterControllerInput},
+};
+
+use super::project_probe::EditorProject;
 
 const BENCHMARK_WARMUP_SECONDS: f64 = 5.0;
 const BENCHMARK_SAMPLE_SECONDS: f64 = 60.0;
@@ -26,6 +38,7 @@ pub struct ViewportProbePlugin;
 impl Plugin for ViewportProbePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup_viewport_probe)
+            .init_resource::<AnimationWorkspaceUi>()
             .add_systems(EguiPrimaryContextPass, draw_editor_shell)
             .add_systems(
                 PreUpdate,
@@ -59,9 +72,37 @@ struct SelectionState {
     prop_selected: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EditorWorkspaceTab {
+    #[default]
+    Scene,
+    SceneTimeline,
+    ClipPreview,
+}
+
+#[derive(Resource)]
+struct AnimationWorkspaceUi {
+    tab: EditorWorkspaceTab,
+    selected_key_time: f32,
+    key_translation: [f32; 3],
+    key_yaw_degrees: f32,
+}
+
+impl Default for AnimationWorkspaceUi {
+    fn default() -> Self {
+        Self {
+            tab: EditorWorkspaceTab::Scene,
+            selected_key_time: 0.0,
+            key_translation: [1.35, 1.02, -2.82],
+            key_yaw_degrees: 0.0,
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 pub(super) struct ViewportInputFocus(pub(super) bool);
 
+#[allow(clippy::too_many_arguments)]
 fn setup_viewport_probe(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -70,6 +111,7 @@ fn setup_viewport_probe(
     mut egui_user_textures: ResMut<EguiUserTextures>,
     mut egui_global_settings: ResMut<EguiGlobalSettings>,
     asset_server: Res<AssetServer>,
+    project: Res<EditorProject>,
 ) {
     egui_global_settings.auto_create_primary_context = false;
 
@@ -135,34 +177,61 @@ fn setup_viewport_probe(
         Transform::from_xyz(1.35, 1.02, -2.82),
         Collider::cuboid(0.55, 1.05, 0.06),
         ProbeDoor,
+        SnapshotObjectId("door".to_owned()),
         Name::new("Lua Door"),
     ));
-    commands.spawn((
-        Mesh3d(meshes.add(Capsule3d::new(0.35, 1.6))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.16, 0.68, 0.93),
-            perceptual_roughness: 0.72,
-            ..default()
-        })),
-        Transform::from_xyz(-1.35, 1.12, 1.8),
-        Collider::capsule_y(0.8, 0.35),
-        SpatialListener::new(0.2),
-        KinematicCharacterController {
-            offset: CharacterLength::Absolute(0.01),
-            snap_to_ground: Some(CharacterLength::Absolute(0.12)),
-            autostep: Some(CharacterAutostep {
-                max_height: CharacterLength::Absolute(0.25),
-                min_width: CharacterLength::Absolute(0.2),
-                include_dynamic_bodies: false,
-            }),
-            max_slope_climb_angle: 45.0_f32.to_radians(),
-            min_slope_slide_angle: 30.0_f32.to_radians(),
-            ..default()
-        },
-        CharacterController::default(),
-        CharacterControllerInput::default(),
-        Name::new("Physics Probe Character"),
-    ));
+    let character = commands
+        .spawn((
+            Transform::from_xyz(-1.35, 1.12, 1.8),
+            Visibility::default(),
+            Collider::capsule_y(0.8, 0.35),
+            SpatialListener::new(0.2),
+            KinematicCharacterController {
+                offset: CharacterLength::Absolute(0.01),
+                snap_to_ground: Some(CharacterLength::Absolute(0.12)),
+                autostep: Some(CharacterAutostep {
+                    max_height: CharacterLength::Absolute(0.25),
+                    min_width: CharacterLength::Absolute(0.2),
+                    include_dynamic_bodies: false,
+                }),
+                max_slope_climb_angle: 45.0_f32.to_radians(),
+                min_slope_slide_angle: 30.0_f32.to_radians(),
+                ..default()
+            },
+            CharacterController::default(),
+            CharacterControllerInput::default(),
+            SnapshotObjectId("character".to_owned()),
+            Name::new("Physics Probe Character"),
+        ))
+        .id();
+    if let Some(animation) = project.snapshot.scene.animation.as_ref()
+        && let Some(binding) = animation
+            .imported_bindings
+            .iter()
+            .find(|binding| binding.object_id == "character")
+        && let Some(asset) = animation
+            .assets
+            .iter()
+            .find(|asset| asset.id == binding.asset_id)
+    {
+        commands.spawn((
+            WorldAssetRoot(
+                asset_server.load(GltfAssetLabel::Scene(0).from_asset(asset.path.clone())),
+            ),
+            stage0_character_model_transform(),
+            ChildOf(character),
+            Name::new("Imported Character Model"),
+        ));
+    } else {
+        commands.entity(character).insert((
+            Mesh3d(meshes.add(Capsule3d::new(0.35, 1.6))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.16, 0.68, 0.93),
+                perceptual_roughness: 0.72,
+                ..default()
+            })),
+        ));
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: 11_000.0,
@@ -180,6 +249,7 @@ fn setup_viewport_probe(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_editor_shell(
     mut contexts: EguiContexts,
     mut viewport: ResMut<ViewportSurface>,
@@ -187,6 +257,10 @@ fn draw_editor_shell(
     mut viewport_focus: ResMut<ViewportInputFocus>,
     mut audio_controls: ResMut<AudioProbeControls>,
     audio_state: Res<AudioProbeState>,
+    mut project: ResMut<EditorProject>,
+    mut animation_data: ResMut<AnimationProbeData>,
+    mut animation: ResMut<AnimationWorkspaceState>,
+    mut workspace_ui: ResMut<AnimationWorkspaceUi>,
     window: Single<&Window, With<PrimaryWindow>>,
     scene_camera: Single<(&Camera, &GlobalTransform), With<SceneViewportCamera>>,
 ) -> Result {
@@ -203,9 +277,49 @@ fn draw_editor_shell(
         ui.horizontal(|ui| {
             ui.heading("Quasar Engine");
             ui.separator();
-            ui.label("Stage 0 · Viewport / Physics");
+            ui.label("Stage 0 · Animation workflow probe");
+            if ui.small_button("Save").clicked() {
+                match project.save() {
+                    Ok(()) => {}
+                    Err(error) => project.status = error,
+                }
+            }
+            if ui.small_button("Reload").clicked() {
+                match project.reload() {
+                    Ok(()) => {
+                        animation_data.animation = project.snapshot.scene.animation.clone();
+                        *animation = AnimationWorkspaceState::default();
+                        animation.reset_door_clip();
+                        workspace_ui.selected_key_time = 0.0;
+                        workspace_ui.tab = EditorWorkspaceTab::Scene;
+                    }
+                    Err(error) => project.status = error,
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(format!("DPI {:.0}%", window.scale_factor() * 100.0));
+            });
+        });
+    });
+
+    egui::Panel::top("quasar_workspace_tabs").show(&mut viewport_ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut workspace_ui.tab, EditorWorkspaceTab::Scene, "Scene");
+            ui.selectable_value(
+                &mut workspace_ui.tab,
+                EditorWorkspaceTab::SceneTimeline,
+                "Scene Timeline",
+            );
+            ui.selectable_value(
+                &mut workspace_ui.tab,
+                EditorWorkspaceTab::ClipPreview,
+                "Clip Preview",
+            );
+            ui.separator();
+            ui.label(if project.dirty {
+                "Unsaved changes"
+            } else {
+                project.status.as_str()
             });
         });
     });
@@ -252,9 +366,35 @@ fn draw_editor_shell(
             ));
         });
 
+    if workspace_ui.tab == EditorWorkspaceTab::SceneTimeline {
+        egui::Panel::bottom("quasar_animation_timeline")
+            .default_size(230.0)
+            .resizable(true)
+            .show(&mut viewport_ui, |ui| {
+                draw_scene_timeline(
+                    ui,
+                    &mut project,
+                    &mut animation_data,
+                    &mut animation,
+                    &mut workspace_ui,
+                );
+            });
+    } else if workspace_ui.tab == EditorWorkspaceTab::ClipPreview {
+        egui::Panel::bottom("quasar_animation_clip_preview")
+            .default_size(170.0)
+            .resizable(true)
+            .show(&mut viewport_ui, |ui| {
+                draw_clip_preview(ui, &project, &mut animation, &mut workspace_ui);
+            });
+    }
+
     egui::CentralPanel::default().show(&mut viewport_ui, |ui| {
         ui.horizontal(|ui| {
-            ui.strong("Viewport");
+            ui.strong(match workspace_ui.tab {
+                EditorWorkspaceTab::Scene => "Scene",
+                EditorWorkspaceTab::SceneTimeline => "Scene Timeline · Door animation",
+                EditorWorkspaceTab::ClipPreview => "Clip Preview · GLB character",
+            });
             ui.separator();
             ui.label("WASD / Space · E door");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -303,6 +443,257 @@ fn draw_editor_shell(
     });
 
     Ok(())
+}
+
+fn draw_scene_timeline(
+    ui: &mut egui::Ui,
+    project: &mut EditorProject,
+    animation_data: &mut AnimationProbeData,
+    animation: &mut AnimationWorkspaceState,
+    workspace_ui: &mut AnimationWorkspaceUi,
+) {
+    let Some(snapshot_animation) = project.snapshot.scene.animation.as_ref() else {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            "This project has no animation data.",
+        );
+        return;
+    };
+    let Some(clip) = snapshot_animation
+        .object_clips
+        .iter()
+        .find(|clip| clip.id == animation.door_clip_id)
+    else {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            "The selected scene clip is missing.",
+        );
+        return;
+    };
+    let clip_duration = clip.duration_seconds;
+    let clip_id = clip.id.clone();
+    ui.horizontal(|ui| {
+        ui.label(format!("Clip: {} · target {}", clip.id, clip.object_id));
+        if ui.small_button("Play").clicked() {
+            animation.play_door_clip();
+        }
+        if ui.small_button("Pause").clicked() {
+            animation.door_playing = false;
+        }
+        if ui.small_button("Stop / Reset").clicked() {
+            animation.reset_door_clip();
+        }
+        ui.label(format!(
+            "{:.3} / {:.3} s",
+            animation.door_time_seconds, clip_duration
+        ));
+    });
+    let mut timeline_time = animation.door_time_seconds;
+    if ui
+        .add(egui::Slider::new(&mut timeline_time, 0.0..=clip_duration).text("Time"))
+        .changed()
+    {
+        animation.scrub_door_clip(timeline_time);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Keys:");
+        for track in &clip.tracks {
+            for key in &track.keys {
+                let value = match track.property {
+                    AnimatedTransformProperty::Translation => "Position",
+                    AnimatedTransformProperty::Rotation => "Rotation",
+                };
+                if ui
+                    .small_button(format!("{value} · {:.3}s", key.time_seconds))
+                    .clicked()
+                {
+                    workspace_ui.selected_key_time = key.time_seconds;
+                    animation.scrub_door_clip(key.time_seconds);
+                    if let AnimationValueSnapshot::Vec3(position) = &key.value {
+                        workspace_ui.key_translation = *position;
+                    }
+                    if let AnimationValueSnapshot::Quaternion(rotation) = &key.value {
+                        workspace_ui.key_yaw_degrees = Quat::from_array(*rotation)
+                            .to_euler(EulerRot::YXZ)
+                            .0
+                            .to_degrees();
+                    }
+                }
+            }
+        }
+    });
+    ui.separator();
+    ui.label("Set key values at the selected time");
+    ui.horizontal(|ui| {
+        ui.label("Position");
+        for value in &mut workspace_ui.key_translation {
+            ui.add(
+                egui::DragValue::new(value)
+                    .speed(0.01)
+                    .range(-100.0..=100.0),
+            );
+        }
+        ui.label("Yaw °");
+        ui.add(egui::DragValue::new(&mut workspace_ui.key_yaw_degrees).speed(0.5));
+        ui.add(
+            egui::DragValue::new(&mut workspace_ui.selected_key_time)
+                .speed(0.01)
+                .range(0.0..=clip_duration)
+                .suffix(" s"),
+        );
+        if ui.button("Add / Update Key").clicked() {
+            let rotation = Quat::from_rotation_y(workspace_ui.key_yaw_degrees.to_radians());
+            let changed = project
+                .snapshot
+                .scene
+                .animation
+                .as_mut()
+                .and_then(|animation| {
+                    animation
+                        .object_clips
+                        .iter_mut()
+                        .find(|clip| clip.id == clip_id)
+                })
+                .is_some_and(|clip| {
+                    upsert_animation_key(
+                        clip,
+                        AnimatedTransformProperty::Translation,
+                        workspace_ui.selected_key_time,
+                        AnimationValueSnapshot::Vec3(workspace_ui.key_translation),
+                    );
+                    upsert_animation_key(
+                        clip,
+                        AnimatedTransformProperty::Rotation,
+                        workspace_ui.selected_key_time,
+                        AnimationValueSnapshot::Quaternion(rotation.to_array()),
+                    );
+                    true
+                });
+            if changed {
+                project.dirty = true;
+                project.status = "Animation key edited — save to keep this change".to_owned();
+                animation_data.animation = project.snapshot.scene.animation.clone();
+                animation.scrub_door_clip(workspace_ui.selected_key_time);
+            }
+        }
+    });
+    if !animation.diagnostics.is_empty() {
+        ui.separator();
+        for diagnostic in &animation.diagnostics {
+            ui.colored_label(egui::Color32::LIGHT_RED, diagnostic);
+        }
+    }
+}
+
+fn upsert_animation_key(
+    clip: &mut quasar_project::ObjectAnimationClipSnapshot,
+    property: AnimatedTransformProperty,
+    time_seconds: f32,
+    value: AnimationValueSnapshot,
+) {
+    let track = if let Some(track) = clip
+        .tracks
+        .iter_mut()
+        .find(|track| track.property == property)
+    {
+        track
+    } else {
+        clip.tracks.push(TransformAnimationTrackSnapshot {
+            property,
+            interpolation: quasar_project::AnimationInterpolation::SmoothStep,
+            keys: Vec::new(),
+        });
+        clip.tracks.last_mut().expect("the track was just inserted")
+    };
+    if let Some(existing) = track
+        .keys
+        .iter_mut()
+        .find(|key| (key.time_seconds - time_seconds).abs() < 0.0005)
+    {
+        existing.value = value;
+        existing.time_seconds = time_seconds;
+    } else {
+        track.keys.push(AnimationKeySnapshot {
+            time_seconds,
+            value,
+        });
+    }
+    track
+        .keys
+        .sort_by(|left, right| left.time_seconds.total_cmp(&right.time_seconds));
+}
+
+fn draw_clip_preview(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    animation: &mut AnimationWorkspaceState,
+    _workspace_ui: &mut AnimationWorkspaceUi,
+) {
+    let Some(snapshot_animation) = project.snapshot.scene.animation.as_ref() else {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            "This project has no imported animation data.",
+        );
+        return;
+    };
+    let Some(binding) = snapshot_animation
+        .imported_bindings
+        .iter()
+        .find(|binding| binding.object_id == "character")
+    else {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            "No imported clips are bound to the character.",
+        );
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Character clips:");
+        for clip in &binding.clips {
+            let selected = animation.character_clip_source == clip.source_clip_id;
+            if ui.selectable_label(selected, &clip.display_name).clicked() {
+                animation.select_character_clip(clip.source_clip_id.clone());
+            }
+        }
+        ui.separator();
+        if ui
+            .small_button(if animation.character_preview_playing {
+                "Pause"
+            } else {
+                "Play"
+            })
+            .clicked()
+        {
+            animation.character_preview_playing = !animation.character_preview_playing;
+        }
+        if ui.small_button("Restart").clicked() {
+            animation.seek_character_clip(0.0);
+            animation.character_preview_playing = true;
+        }
+    });
+    let mut preview_time = animation.character_preview_time_seconds;
+    let clip_duration = animation.character_duration_seconds.max(0.001);
+    let seek_changed = ui
+        .add(
+            egui::Slider::new(&mut preview_time, 0.0..=clip_duration).text(format!(
+                "{} · preview time",
+                animation.character_clip_source
+            )),
+        )
+        .changed();
+    let seek_requested = ui.button("Seek").clicked();
+    if seek_changed || seek_requested {
+        animation.character_preview_time_seconds = preview_time;
+        animation.character_seek_revision = animation.character_seek_revision.wrapping_add(1);
+        animation.character_preview_playing = false;
+    }
+    if !animation.diagnostics.is_empty() {
+        ui.separator();
+        for diagnostic in &animation.diagnostics {
+            ui.colored_label(egui::Color32::LIGHT_RED, diagnostic);
+        }
+    }
 }
 
 fn collect_viewport_character_input(
@@ -482,7 +873,7 @@ fn ray_intersects_aabb(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> b
 mod tests {
     use super::{
         ViewportSurface, editor_benchmark_route_direction, percentile, ray_intersects_aabb,
-        read_viewport_input, requested_viewport_size, resize_viewport_target,
+        read_viewport_input, requested_viewport_size, resize_viewport_target, upsert_animation_key,
     };
     use bevy::{
         asset::Assets,
@@ -492,10 +883,55 @@ mod tests {
         window::{PrimaryWindow, WindowResolution},
     };
     use bevy_egui::egui;
+    use quasar_project::{
+        AnimatedTransformProperty, AnimationInterpolation, AnimationKeySnapshot,
+        AnimationValueSnapshot, ObjectAnimationClipSnapshot, TransformAnimationTrackSnapshot,
+    };
     use quasar_runtime::physics::CharacterControllerInput;
 
     const MIN: Vec3 = Vec3::splat(-1.0);
     const MAX: Vec3 = Vec3::splat(1.0);
+
+    #[test]
+    fn timeline_key_edits_insert_in_order_and_update_existing_time() {
+        let mut clip = ObjectAnimationClipSnapshot {
+            id: "door_open".to_owned(),
+            object_id: "door".to_owned(),
+            duration_seconds: 1.0,
+            tracks: vec![TransformAnimationTrackSnapshot {
+                property: AnimatedTransformProperty::Translation,
+                interpolation: AnimationInterpolation::SmoothStep,
+                keys: vec![
+                    AnimationKeySnapshot {
+                        time_seconds: 0.0,
+                        value: AnimationValueSnapshot::Vec3([0.0; 3]),
+                    },
+                    AnimationKeySnapshot {
+                        time_seconds: 1.0,
+                        value: AnimationValueSnapshot::Vec3([1.0; 3]),
+                    },
+                ],
+            }],
+            events: Vec::new(),
+        };
+        upsert_animation_key(
+            &mut clip,
+            AnimatedTransformProperty::Translation,
+            0.75,
+            AnimationValueSnapshot::Vec3([0.75; 3]),
+        );
+        upsert_animation_key(
+            &mut clip,
+            AnimatedTransformProperty::Translation,
+            0.75,
+            AnimationValueSnapshot::Vec3([0.8; 3]),
+        );
+
+        let keys = &clip.tracks[0].keys;
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[1].time_seconds, 0.75);
+        assert_eq!(keys[1].value, AnimationValueSnapshot::Vec3([0.8; 3]));
+    }
 
     #[test]
     fn ray_hits_box_from_outside() {

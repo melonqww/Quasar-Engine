@@ -1,8 +1,12 @@
 //! Authoring data and project persistence for Quasar Engine.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+pub mod document;
+pub mod persistence;
+pub mod validation;
 
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
@@ -141,10 +145,7 @@ pub struct SnapshotObject {
 
 impl ProjectSnapshot {
     pub fn read(path: &Path) -> Result<Self, String> {
-        let source = fs::read_to_string(path)
-            .map_err(|error| format!("cannot read snapshot {}: {error}", path.display()))?;
-        let snapshot: Self = serde_json::from_str(&source)
-            .map_err(|error| format!("invalid snapshot {}: {error}", path.display()))?;
+        let snapshot: Self = persistence::read_json(path, "snapshot")?;
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -210,6 +211,16 @@ impl ProjectSnapshot {
             validate_relative_path(label, value)?;
         }
         Ok(())
+    }
+
+    /// Writes a validated snapshot through a same-directory temporary file.
+    /// The final replacement is atomic on supported platforms, so a failed
+    /// serialization or disk write does not truncate the last saved snapshot.
+    pub fn write(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        let encoded = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("cannot encode snapshot {}: {error}", path.display()))?;
+        persistence::write_json_atomically(path, &encoded, "snapshot")
     }
 }
 
@@ -484,6 +495,61 @@ mod tests {
 
         assert_eq!(decoded, expected);
         decoded.validate().expect("snapshot structure is valid");
+    }
+
+    #[test]
+    fn snapshot_file_write_replaces_existing_file_and_roundtrips() {
+        let document = snapshot();
+        let path = std::env::temp_dir().join(format!(
+            "quasar-snapshot-write-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after Unix epoch")
+                .as_nanos()
+        ));
+        document.write(&path).expect("initial snapshot writes");
+        assert_eq!(
+            ProjectSnapshot::read(&path).expect("snapshot reads"),
+            document
+        );
+
+        let mut replacement = document.clone();
+        replacement.scene.name = "Replaced scene".to_owned();
+        replacement
+            .write(&path)
+            .expect("existing snapshot is replaced");
+        assert_eq!(
+            ProjectSnapshot::read(&path)
+                .expect("replacement reads")
+                .scene
+                .name,
+            "Replaced scene"
+        );
+        std::fs::remove_file(path).expect("temporary snapshot is removed");
+    }
+
+    #[test]
+    fn invalid_snapshot_does_not_replace_last_saved_file() {
+        let document = snapshot();
+        let path = std::env::temp_dir().join(format!(
+            "quasar-snapshot-preserve-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after Unix epoch")
+                .as_nanos()
+        ));
+        document.write(&path).expect("initial snapshot writes");
+
+        let mut invalid = document.clone();
+        invalid.scene.name.clear();
+        assert!(invalid.write(&path).is_err());
+        assert_eq!(
+            ProjectSnapshot::read(&path).expect("original remains readable"),
+            document
+        );
+        std::fs::remove_file(path).expect("temporary snapshot is removed");
     }
 
     #[test]

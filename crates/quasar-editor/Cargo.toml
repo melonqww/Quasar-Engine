@@ -8,3 +8,7 @@ bevy.workspace = true
 bevy_egui.workspace = true
 bevy_rapier3d.workspace = true
 quasar-runtime.workspace = true
+quasar-project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

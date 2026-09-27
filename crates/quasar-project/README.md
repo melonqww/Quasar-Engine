@@ -1,5 +1,7 @@
 # Данные проекта
 
-Документы, идентификаторы, команды и хранение авторских данных. Здесь нет UI, GPU и runtime Entity. Для технического этапа 0 crate задаёт версионированный `ProjectSnapshot` JSON с относительными ссылками на ресурсы; Player проверяет и загружает snapshot независимо от editor.
+`quasar-project` содержит авторские документы, stable IDs, валидацию и файловое сохранение. Он не зависит от UI, GPU или runtime Entity.
 
-Для Stage 0 `SceneSnapshot.animation` — необязательное расширение текущей схемы: старые fixture без этого поля продолжают читаться. Оно содержит проверяемые ключи transform с временем и интерполяцией, события звука по AssetId и привязки импортированных клипов по паре AssetId + точное имя клипа в GLB. Это только формат технической пробы, не окончательная схема SceneDocument. Неизвестный объект, asset, некорректные значения/времена и отсутствующий файл дают явную ошибку; проверка того, что subresource name реально присутствует внутри GLB, выполняется загрузчиком на следующем шаге.
+Stage 1 вводит отдельную версионированную модель `ProjectDocument` → `SceneDocument` → scene objects. UUID сохраняются между открытиями; иерархия задаётся `parent_id`, transforms хранятся локально, а component payload имеет собственный type ID и schema version. Один JSON project bundle сохраняется атомарно после validation. Session revision не сериализуется.
+
+`ProjectSnapshot` остаётся совместимым форматом Stage 0 fixtures и probe Player. Его `animation` extension, fixed object kinds и ссылки по относительным путям не становятся частью постоянной SceneDocument схемы. Отличия и намеренный предел первой версии описаны в [проектном формате](../../Architecture/design/PROJECT_DOCUMENT.md).

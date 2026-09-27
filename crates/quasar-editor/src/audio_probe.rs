@@ -1,6 +1,7 @@
 //! Reproducible loop, spatial effect, and stop/restart probe for Bevy Audio.
 
 use bevy::{audio::Volume, prelude::*};
+use quasar_runtime::animation::AnimationSessionAudio;
 
 pub struct AudioProbePlugin;
 
@@ -43,7 +44,7 @@ type ProbeSessionAudioQuery<'w, 's> = Query<
         Option<&'static AudioSink>,
         Option<&'static SpatialAudioSink>,
     ),
-    With<ProbeSessionAudio>,
+    Or<(With<ProbeSessionAudio>, With<AnimationSessionAudio>)>,
 >;
 
 fn start_ambient_loop(

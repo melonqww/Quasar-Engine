@@ -1,10 +1,11 @@
 [package]
-name = "quasar-project"
+name = "quasar-mcp"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-path = "src/lib.rs"
+[[bin]]
+name = "quasar-mcp"
+path = "src/main.rs"
 
 [dependencies]
 serde.workspace = true
