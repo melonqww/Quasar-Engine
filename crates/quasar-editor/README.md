@@ -2,4 +2,4 @@
 
 Авторский рабочий процесс: панели, изменения документов, preview, импорт, Advisor, Play и export. Не реализует вторую игровую физику или отдельный runtime.
 
-Для технической read-only MCP-сессии можно передать `--project-document <path>`: Editor загрузит постоянный документ и опубликует локальное подключение для `quasar-mcp`. В этой пробе viewport пока остаётся Stage 0 compatibility viewport; подключение документа к интерфейсу Editor будет отдельной задачей.
+Для технической сессии постоянного проекта можно передать `--project-document <path>`: Editor откроет отдельный document mode с иерархией объектов, выбором, созданием/удалением, инспектором, transform controls и gizmo, Undo/Redo и Save. Сцена строится из того же `ProjectDocument`; пока каждый объект показан placeholder-кубом, без viewport picking и полноценных компонентов. В этом режиме Editor публикует локальную сессию для `quasar-mcp`.

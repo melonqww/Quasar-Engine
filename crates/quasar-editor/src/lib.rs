@@ -1,6 +1,8 @@
 //! Editor shell and UI integrations.
 
 mod audio_probe;
+mod document_editor;
+pub mod document_session;
 mod gameplay_probe;
 mod mcp_session;
 mod project_probe;
@@ -11,6 +13,16 @@ use bevy_egui::EguiPlugin;
 
 /// Adds egui to the shared Bevy/Rapier compatibility probe.
 pub fn compatibility_probe_app() -> App {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if let Some(path) = mcp_session::project_document_argument(&arguments)
+        .unwrap_or_else(|error| panic!("invalid Editor project document argument: {error}"))
+    {
+        let session = document_session::EditorDocumentSession::open(&path)
+            .unwrap_or_else(|error| panic!("cannot open Editor project document: {error}"));
+        let mcp = mcp_session::start_mcp_session(session.clone())
+            .unwrap_or_else(|error| panic!("cannot start Editor MCP session: {error}"));
+        return document_editor::document_editor_app(session, mcp);
+    }
     let project = project_probe::open_stage0_project()
         .unwrap_or_else(|error| panic!("cannot open Stage 0 animation project: {error}"));
     let benchmark = std::env::args().any(|argument| argument == "--benchmark-60s");
@@ -24,16 +36,6 @@ pub fn compatibility_probe_app() -> App {
     })
     .insert_resource(project)
     .add_plugins(quasar_runtime::animation::AnimationProbePlugin);
-    if let Some(path) =
-        mcp_session::project_document_argument(&std::env::args().collect::<Vec<_>>())
-            .unwrap_or_else(|error| panic!("invalid Editor project document argument: {error}"))
-    {
-        let open_session = mcp_session::open_project_session(&path)
-            .unwrap_or_else(|error| panic!("cannot open Editor project document: {error}"));
-        let mcp_server = mcp_session::start_mcp_session(open_session)
-            .unwrap_or_else(|error| panic!("cannot start read-only MCP session: {error}"));
-        app.insert_resource(mcp_server);
-    }
     app.add_plugins(EguiPlugin::default());
     app.add_plugins(viewport_probe::ViewportProbePlugin);
     app.add_plugins(audio_probe::AudioProbePlugin);

@@ -1,4 +1,4 @@
-//! Small stdio MCP adapter for read-only access to the active Quasar Editor session.
+//! stdio MCP adapter for the active Quasar Editor document session.
 
 use std::{
     env,
@@ -80,7 +80,7 @@ fn serve_stdio() -> Result<(), String> {
                     "protocolVersion": if supported_protocol_version(requested) { requested } else { PROTOCOL_VERSION },
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                    "instructions": "Read-only view of the ProjectDocument currently opened in Quasar Editor. The adapter cannot edit files or project data."
+                    "instructions": "Controlled access to the ProjectDocument currently opened in Quasar Editor. Preview scene edits before applying them; every write uses the current expected_revision."
                 }))
             }
             "notifications/initialized" => continue,
@@ -136,6 +136,41 @@ fn tools_list() -> Value {
                     "required": ["scene_id"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "preview_scene_command",
+                "description": "Validate a scene command on a private candidate and return its result without changing the open project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "command": { "type": "object", "description": "SceneCommand tagged object, such as {kind: set_transform, scene_id, object_id, transform}." } },
+                    "required": ["expected_revision", "command"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "apply_scene_command",
+                "description": "Apply one validated scene command to the open project. Use the current expected_revision; stale edits are rejected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "command": { "type": "object", "description": "SceneCommand tagged object." } },
+                    "required": ["expected_revision", "command"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "undo",
+                "description": "Undo the most recent scene edit in the open Editor session.",
+                "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 } }, "required": ["expected_revision"], "additionalProperties": false }
+            },
+            {
+                "name": "redo",
+                "description": "Redo the most recently undone scene edit in the open Editor session.",
+                "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 } }, "required": ["expected_revision"], "additionalProperties": false }
+            },
+            {
+                "name": "save_project",
+                "description": "Save the open ProjectDocument after checking expected_revision.",
+                "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 } }, "required": ["expected_revision"], "additionalProperties": false }
             }
         ]
     })
@@ -154,7 +189,13 @@ fn call_tool(request: &Value, manifest_path: &PathBuf) -> Result<Value, (i64, St
         .cloned()
         .unwrap_or_else(|| json!({}));
     let result = match name {
-        "get_project_state" | "list_scenes" => query_editor(manifest_path, name, &arguments),
+        "get_project_state"
+        | "list_scenes"
+        | "preview_scene_command"
+        | "apply_scene_command"
+        | "undo"
+        | "redo"
+        | "save_project" => query_editor(manifest_path, name, &arguments),
         "get_scene" => {
             let scene_id = arguments
                 .get("scene_id")

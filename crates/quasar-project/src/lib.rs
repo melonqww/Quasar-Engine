@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub mod commands;
 pub mod document;
 pub mod persistence;
 pub mod validation;

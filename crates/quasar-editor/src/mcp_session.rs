@@ -1,4 +1,4 @@
-//! Read-only bridge from an open Editor document to the local MCP adapter.
+//! Authenticated local bridge from the open Editor document session to the MCP adapter.
 
 use std::{
     fs::{self, OpenOptions},
@@ -6,7 +6,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -14,10 +14,12 @@ use std::{
 };
 
 use bevy::prelude::Resource;
-use quasar_project::document::{ProjectDocument, SceneId};
+use quasar_project::{commands::SceneCommand, document::SceneId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use crate::document_session::EditorDocumentSession;
 
 const SESSION_FILE: &str = "editor-session.json";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -53,11 +55,6 @@ impl Drop for EditorMcpSession {
     }
 }
 
-pub(crate) struct OpenProjectSession {
-    document: Arc<RwLock<ProjectDocument>>,
-    path: PathBuf,
-}
-
 pub(crate) fn project_document_argument(args: &[String]) -> Result<Option<PathBuf>, String> {
     let mut path = None;
     let mut index = 0;
@@ -77,21 +74,9 @@ pub(crate) fn project_document_argument(args: &[String]) -> Result<Option<PathBu
     Ok(path)
 }
 
-pub(crate) fn open_project_session(path: &Path) -> Result<OpenProjectSession, String> {
-    let path = fs::canonicalize(path).map_err(|error| {
-        format!(
-            "cannot resolve project document {}: {error}",
-            path.display()
-        )
-    })?;
-    let document = ProjectDocument::load(&path)?;
-    Ok(OpenProjectSession {
-        document: Arc::new(RwLock::new(document)),
-        path,
-    })
-}
-
-pub(crate) fn start_mcp_session(session: OpenProjectSession) -> Result<EditorMcpSession, String> {
+pub(crate) fn start_mcp_session(
+    session: EditorDocumentSession,
+) -> Result<EditorMcpSession, String> {
     let directory = std::env::temp_dir().join("QuasarEngine");
     fs::create_dir_all(&directory).map_err(|error| {
         format!(
@@ -119,7 +104,7 @@ pub(crate) fn start_mcp_session(session: OpenProjectSession) -> Result<EditorMcp
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
-    let document = Arc::clone(&session.document);
+    let document = session.clone();
     let worker_token = descriptor.token.clone();
     let worker = thread::Builder::new()
         .name("quasar-editor-mcp-session".to_owned())
@@ -140,8 +125,11 @@ pub(crate) fn start_mcp_session(session: OpenProjectSession) -> Result<EditorMcp
         .map_err(|error| format!("cannot start local MCP worker: {error}"))?;
 
     eprintln!(
-        "Quasar Editor read-only MCP session is available for '{}' (pid {})",
-        session.path.display(),
+        "Quasar Editor MCP session is available for '{}' (pid {})",
+        session
+            .snapshot()
+            .map(|snapshot| snapshot.path.display().to_string())
+            .unwrap_or_else(|_| "<unavailable>".to_owned()),
         descriptor.editor_pid
     );
     Ok(EditorMcpSession {
@@ -210,7 +198,7 @@ fn publish_manifest(path: &Path, descriptor: &SessionDescriptor) -> Result<(), S
 fn serve_internal_request(
     mut stream: TcpStream,
     expected_token: &str,
-    document: &RwLock<ProjectDocument>,
+    session: &EditorDocumentSession,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -224,7 +212,7 @@ fn serve_internal_request(
         }
         Ok(_) => serde_json::from_slice::<Value>(&request_bytes)
             .map_err(|error| format!("invalid local MCP request: {error}"))
-            .and_then(|request| handle_internal_request(request, expected_token, document)),
+            .and_then(|request| handle_internal_request(request, expected_token, session)),
         Err(error) => Err(format!("cannot read local MCP request: {error}")),
     };
     let response = match response {
@@ -238,7 +226,7 @@ fn serve_internal_request(
 fn handle_internal_request(
     request: Value,
     expected_token: &str,
-    document: &RwLock<ProjectDocument>,
+    session: &EditorDocumentSession,
 ) -> Result<Value, String> {
     if request.get("token").and_then(Value::as_str) != Some(expected_token) {
         return Err("local MCP session authentication failed".to_owned());
@@ -247,9 +235,54 @@ fn handle_internal_request(
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "local MCP method is missing".to_owned())?;
-    let document = document
-        .read()
-        .map_err(|_| "open Editor project state is unavailable".to_owned())?;
+    let arguments = request
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if matches!(method, "preview_scene_command" | "apply_scene_command") {
+        let expected_revision = required_revision(&arguments)?;
+        let command: SceneCommand = serde_json::from_value(
+            arguments
+                .get("command")
+                .cloned()
+                .ok_or_else(|| "command is required".to_owned())?,
+        )
+        .map_err(|error| format!("invalid scene command: {error}"))?;
+        if method == "preview_scene_command" {
+            let preview = session.preview_command(command, expected_revision)?;
+            return Ok(json!({
+                "revision": preview.revision,
+                "label": preview.label,
+                "affected_objects": preview.affected_objects,
+                "changed": preview.changed,
+                "document": preview.document
+            }));
+        }
+        let receipt = session.apply_command(command, expected_revision)?;
+        return Ok(json!({
+            "revision": receipt.revision,
+            "label": receipt.label,
+            "affected_objects": receipt.affected_objects,
+            "changed": receipt.changed
+        }));
+    }
+    if matches!(method, "undo" | "redo") {
+        let expected_revision = required_revision(&arguments)?;
+        let receipt = if method == "undo" {
+            session.undo(expected_revision)?
+        } else {
+            session.redo(expected_revision)?
+        };
+        return Ok(
+            json!({ "revision": receipt.revision, "label": receipt.label, "affected_objects": receipt.affected_objects, "changed": receipt.changed }),
+        );
+    }
+    if method == "save_project" {
+        let saved = session.save(required_revision(&arguments)?)?;
+        return Ok(json!({ "revision": saved.revision, "dirty": saved.dirty, "path": saved.path }));
+    }
+    let snapshot = session.snapshot()?;
+    let document = &snapshot.document;
     let active_scene = document
         .scenes
         .iter()
@@ -261,11 +294,12 @@ fn handle_internal_request(
             "name": document.name,
             "active_scene_id": document.active_scene_id,
             "scene_count": document.scenes.len(),
-            "revision": 0
+            "revision": snapshot.revision,
+            "dirty": snapshot.dirty
         })),
         "list_scenes" => Ok(json!({
             "project_id": document.project_id,
-            "revision": 0,
+            "revision": snapshot.revision,
             "scenes": document.scenes.iter().map(|scene| json!({
                 "id": scene.id,
                 "name": scene.name,
@@ -289,11 +323,18 @@ fn handle_internal_request(
                 .ok_or_else(|| format!("scene '{scene_id:?}' is not in the open project"))?;
             Ok(json!({
                 "project_id": document.project_id,
-                "revision": 0,
+                "revision": snapshot.revision,
                 "active": scene.id == active_scene.id,
                 "scene": scene
             }))
         }
         other => Err(format!("unsupported local MCP method '{other}'")),
     }
+}
+
+fn required_revision(arguments: &Value) -> Result<u64, String> {
+    arguments
+        .get("expected_revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "expected_revision must be a non-negative integer".to_owned())
 }
