@@ -3,7 +3,10 @@
 mod audio_probe;
 mod document_editor;
 pub mod document_session;
+mod document_viewport;
+mod editor_style;
 mod gameplay_probe;
+mod import;
 mod mcp_session;
 mod project_probe;
 mod viewport_probe;
@@ -19,9 +22,10 @@ pub fn compatibility_probe_app() -> App {
     {
         let session = document_session::EditorDocumentSession::open(&path)
             .unwrap_or_else(|error| panic!("cannot open Editor project document: {error}"));
-        let mcp = mcp_session::start_mcp_session(session.clone())
+        let jobs = import::jobs::AssetJobService::default();
+        let mcp = mcp_session::start_mcp_session(session.clone(), jobs.clone())
             .unwrap_or_else(|error| panic!("cannot start Editor MCP session: {error}"));
-        return document_editor::document_editor_app(session, mcp);
+        return document_editor::document_editor_app(session, mcp, jobs);
     }
     let project = project_probe::open_stage0_project()
         .unwrap_or_else(|error| panic!("cannot open Stage 0 animation project: {error}"));

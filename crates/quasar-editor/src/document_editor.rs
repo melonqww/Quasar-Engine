@@ -3,11 +3,15 @@
 use std::collections::HashMap;
 
 use bevy::{
+    asset::AssetPlugin,
+    gltf::GltfAssetLabel,
     prelude::*,
     window::{Window, WindowPlugin},
+    world_serialization::WorldAssetRoot,
 };
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use quasar_project::{
+    assets::{AssetCatalog, AssetId, AssetKind, AssetRecord, AssetStatus, ModelAssetComponent},
     commands::SceneCommand,
     document::{
         ObjectId, ProjectDocument, SceneDocument, SceneId, SceneObjectDocument, TransformDocument,
@@ -16,8 +20,14 @@ use quasar_project::{
 
 use crate::{
     document_session::{EditorDocumentSession, TransformGestureId},
+    import::jobs::{AssetJobService, AssetJobSnapshot, AssetJobStatus},
     mcp_session::EditorMcpSession,
 };
+use crate::{
+    document_viewport::{self, DocumentViewport},
+    editor_style::{self as chrome, Icon},
+};
+use uuid::Uuid;
 
 #[derive(Resource, Default)]
 struct Selection(Option<ObjectId>);
@@ -28,11 +38,40 @@ struct UiState {
     gesture: Option<(TransformGestureId, ObjectId)>,
     gizmo_mode: GizmoMode,
     status: String,
+    workspace: WorkspaceTab,
+    advanced: bool,
+    console_open: bool,
+    hierarchy_search: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorkspaceTab {
+    #[default]
+    Scene,
+    Assets,
+}
+
+#[derive(Resource, Default)]
+struct AssetBrowserState {
+    project_root: Option<std::path::PathBuf>,
+    records: Vec<AssetRecord>,
+    diagnostics: Vec<(std::path::PathBuf, String)>,
+    search: String,
+    import_path: String,
+    reimport_path: String,
+    message: String,
+    selected: Option<AssetId>,
+    last_dropped_path: Option<std::path::PathBuf>,
+    url_input: String,
+    author_input: String,
+    license_input: String,
+    seen_jobs: std::collections::HashSet<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum GizmoMode {
     #[default]
+    Select,
     Move,
     Rotate,
     Scale,
@@ -44,43 +83,46 @@ struct DocumentObjectVisual;
 #[derive(Resource, Default)]
 struct RenderedRevision(Option<u64>);
 
-pub(crate) fn document_editor_app(session: EditorDocumentSession, mcp: EditorMcpSession) -> App {
+pub(crate) fn document_editor_app(
+    session: EditorDocumentSession,
+    mcp: EditorMcpSession,
+    jobs: AssetJobService,
+) -> App {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Quasar Engine".into(),
-            name: Some("quasar.editor".into()),
-            resolution: (1440, 900).into(),
-            resizable: true,
-            ..default()
-        }),
-        ..default()
-    }))
+    let asset_root = session
+        .snapshot()
+        .ok()
+        .and_then(|snapshot| snapshot.path.parent().map(|path| path.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Quasar Engine".into(),
+                    name: Some("quasar.editor".into()),
+                    resolution: (1440, 900).into(),
+                    resizable: true,
+                    ..default()
+                }),
+                ..default()
+            })
+            .set(AssetPlugin {
+                file_path: asset_root.to_string_lossy().into_owned(),
+                ..default()
+            }),
+    )
     .add_plugins(EguiPlugin::default())
     .insert_resource(session)
     .insert_resource(mcp)
+    .insert_resource(jobs)
     .init_resource::<Selection>()
     .init_resource::<UiState>()
+    .init_resource::<AssetBrowserState>()
     .init_resource::<RenderedRevision>()
-    .add_systems(Startup, setup_document_viewport)
-    .add_systems(Update, sync_document_scene)
+    .add_systems(Startup, document_viewport::setup)
+    .add_systems(Update, (sync_document_scene, document_viewport::resize))
     .add_systems(EguiPrimaryContextPass, draw_document_editor);
     app
-}
-
-fn setup_document_viewport(mut commands: Commands) {
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(7.0, 6.0, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 8500.0,
-            shadow_maps_enabled: true,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.6, 0.0)),
-    ));
 }
 
 fn sync_document_scene(
@@ -90,6 +132,7 @@ fn sync_document_scene(
     old_objects: Query<Entity, With<DocumentObjectVisual>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
 ) {
     let Ok(snapshot) = session.snapshot() else {
         return;
@@ -104,9 +147,34 @@ fn sync_document_scene(
         return;
     };
     let world = scene_world_transforms(scene);
+    let asset_catalog = AssetCatalog::scan(
+        snapshot
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
     for object in &scene.objects {
         let transform = world.get(&object.id).copied().unwrap_or_default();
-        let color = Color::srgb(0.3, 0.65, 0.95);
+        let model_path = ModelAssetComponent::from_components(&object.components)
+            .ok()
+            .flatten()
+            .and_then(|reference| {
+                asset_catalog.assets.iter().find(|asset| {
+                    asset.metadata.asset_id == reference.asset_id
+                        && asset.metadata.kind == AssetKind::Model
+                        && asset.status == AssetStatus::Ready
+                })
+            })
+            .map(|asset| asset.metadata.source_path.clone());
+        if let Some(model_path) = model_path {
+            commands.spawn((
+                DocumentObjectVisual,
+                WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(model_path))),
+                transform,
+            ));
+            continue;
+        }
+        let color = Color::srgb(0.58, 0.56, 0.52);
         commands.spawn((
             DocumentObjectVisual,
             Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -125,6 +193,9 @@ fn draw_document_editor(
     session: Res<EditorDocumentSession>,
     mut selection: ResMut<Selection>,
     mut ui_state: ResMut<UiState>,
+    mut asset_browser: ResMut<AssetBrowserState>,
+    jobs: Res<AssetJobService>,
+    mut viewport: ResMut<DocumentViewport>,
 ) -> Result {
     let Ok(snapshot) = session.snapshot() else {
         return Ok(());
@@ -135,6 +206,48 @@ fn draw_document_editor(
     let scene_id = scene.id;
     let objects = scene.objects.clone();
     let ctx = contexts.ctx_mut()?;
+    chrome::install(ctx);
+    let project_root = snapshot
+        .path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    if asset_browser.project_root.as_ref() != Some(&project_root) {
+        refresh_asset_catalog(&mut asset_browser, &project_root);
+        asset_browser.project_root = Some(project_root.clone());
+    }
+    let recent_jobs = jobs.recent(8).unwrap_or_default();
+    let mut refresh_after_jobs = false;
+    for job in &recent_jobs {
+        if job.status == AssetJobStatus::Succeeded && asset_browser.seen_jobs.insert(job.job_id) {
+            refresh_after_jobs = true;
+            if let Some(asset_id) = job.asset_id {
+                asset_browser.selected = Some(asset_id);
+            }
+        }
+    }
+    if refresh_after_jobs {
+        refresh_asset_catalog(&mut asset_browser, &project_root);
+    }
+    let dropped_paths = ctx.input(|input| {
+        input
+            .raw
+            .dropped_files
+            .iter()
+            .filter_map(|file| {
+                let path = file.path();
+                (!path.as_os_str().is_empty()).then(|| path.to_path_buf())
+            })
+            .collect::<Vec<_>>()
+    });
+    if dropped_paths.is_empty() {
+        asset_browser.last_dropped_path = None;
+    } else if let Some(path) = dropped_paths.first()
+        && asset_browser.last_dropped_path.as_ref() != Some(path)
+    {
+        asset_browser.last_dropped_path = Some(path.clone());
+        start_local_asset_job(&mut asset_browser, &jobs, &project_root, path);
+    }
     let mut editor_ui = egui::Ui::new(
         ctx.clone(),
         "quasar_document_editor".into(),
@@ -143,108 +256,200 @@ fn draw_document_editor(
             .max_rect(ctx.viewport_rect()),
     );
 
-    egui::Panel::top("document_toolbar").show(&mut editor_ui, |ui| {
+    egui::Panel::top("document_toolbar").frame(chrome::toolbar_frame()).show(&mut editor_ui, |ui| {
         ui.horizontal(|ui| {
-            ui.heading(&snapshot.document.name);
-            ui.separator();
-            if ui.button("＋ Object").clicked() {
-                let object = SceneObjectDocument::new(next_object_name(&objects), selection.0);
-                match session.apply_command(
-                    SceneCommand::CreateObject {
-                        scene_id,
-                        object: object.clone(),
-                    },
-                    snapshot.revision,
-                ) {
-                    Ok(_) => selection.0 = Some(object.id),
-                    Err(error) => ui_state.status = error,
-                }
+            if chrome::tab(ui, "Scene", ui_state.workspace == WorkspaceTab::Scene).clicked() {
+                ui_state.workspace = WorkspaceTab::Scene;
             }
-            if ui
-                .add_enabled(selection.0.is_some(), egui::Button::new("Delete"))
-                .clicked()
-                && let Some(object_id) = selection.0
-            {
-                match session.apply_command(
-                    SceneCommand::DeleteObject {
-                        scene_id,
-                        object_id,
-                    },
-                    snapshot.revision,
-                ) {
-                    Ok(_) => selection.0 = None,
-                    Err(error) => ui_state.status = error,
-                }
+            ui.add_enabled(false, egui::Button::new("Code").min_size(egui::vec2(90.0, 34.0)))
+                .on_hover_text("The code workspace is planned; project scripts are not connected yet.");
+            if chrome::tab(ui, "Assets", ui_state.workspace == WorkspaceTab::Assets).clicked() {
+                ui_state.workspace = WorkspaceTab::Assets;
             }
-            ui.separator();
-            if ui
-                .add_enabled(snapshot.undo_depth > 0, egui::Button::new("Undo"))
-                .clicked()
-            {
-                match session.undo(snapshot.revision) {
-                    Ok(_) => {}
-                    Err(error) => ui_state.status = error,
-                }
-            }
-            if ui
-                .add_enabled(snapshot.redo_depth > 0, egui::Button::new("Redo"))
-                .clicked()
-            {
-                match session.redo(snapshot.revision) {
-                    Ok(_) => {}
-                    Err(error) => ui_state.status = error,
-                }
-            }
-            if ui.button("Save").clicked() {
-                match session.save(snapshot.revision) {
-                    Ok(_) => ui_state.status = "Saved".into(),
-                    Err(error) => ui_state.status = error,
-                }
-            }
-            ui.label(if snapshot.dirty {
-                "● Unsaved"
-            } else {
-                "Saved"
-            });
-        });
-    });
-
-    egui::Panel::left("hierarchy")
-        .resizable(true)
-        .default_size(230.0)
-        .show(&mut editor_ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Hierarchy");
-                if ui.button("＋").on_hover_text("Create object").clicked() {
-                    let object = SceneObjectDocument::new(next_object_name(&objects), selection.0);
-                    match session.apply_command(
-                        SceneCommand::CreateObject {
-                            scene_id,
-                            object: object.clone(),
-                        },
-                        snapshot.revision,
-                    ) {
-                        Ok(_) => selection.0 = Some(object.id),
+            chrome::icon_button(ui, Icon::Plus, false, false, "Additional workspaces will be available in a later version.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(ui_state.advanced, "Advanced").clicked() { ui_state.advanced = true; }
+                if ui.selectable_label(!ui_state.advanced, "Basic").clicked() { ui_state.advanced = false; }
+                ui.separator();
+                ui.add_enabled(false, egui::Button::new("Advisor")).on_hover_text("Advisor rules are planned.");
+                chrome::icon_button(ui, Icon::Play, false, false, "Document Play control is planned; standalone Player preview is available from the command line.");
+                ui.separator();
+                if chrome::icon_button(ui, Icon::Redo, false, snapshot.redo_depth > 0, "Redo").clicked()
+                    && let Err(error) = session.redo(snapshot.revision) { ui_state.status = error; }
+                if chrome::icon_button(ui, Icon::Undo, false, snapshot.undo_depth > 0, "Undo").clicked()
+                    && let Err(error) = session.undo(snapshot.revision) { ui_state.status = error; }
+                if chrome::icon_button(ui, Icon::Save, false, true, "Save project").clicked() {
+                    match session.save(snapshot.revision) {
+                        Ok(_) => ui_state.status = "Project saved".into(),
                         Err(error) => ui_state.status = error,
                     }
                 }
             });
-            ui.separator();
-            for object in &objects {
-                let depth = hierarchy_depth(object.id, &objects);
-                let label = format!("{}{}", "　".repeat(depth), object.name);
+        });
+    });
+
+    egui::Panel::bottom("document_console")
+        .frame(chrome::panel_frame())
+        .show(&mut editor_ui, |ui| {
+            ui.horizontal(|ui| {
                 if ui
-                    .selectable_label(selection.0 == Some(object.id), label)
+                    .selectable_label(ui_state.console_open, "Console")
                     .clicked()
                 {
-                    selection.0 = Some(object.id);
+                    ui_state.console_open = !ui_state.console_open;
                 }
+                ui.label(
+                    egui::RichText::new(if ui_state.status.is_empty() {
+                        "Ready"
+                    } else {
+                        &ui_state.status
+                    })
+                    .small()
+                    .color(chrome::MUTED),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("MCP · available")
+                            .small()
+                            .color(chrome::MUTED),
+                    )
+                    .on_hover_text("Local MCP bridge is available for this Editor session.");
+                    ui.label(
+                        egui::RichText::new(if snapshot.dirty {
+                            "Unsaved changes"
+                        } else {
+                            "Saved"
+                        })
+                        .small()
+                        .color(if snapshot.dirty {
+                            chrome::ACCENT
+                        } else {
+                            chrome::MUTED
+                        }),
+                    );
+                });
+            });
+            if ui_state.console_open {
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.separator();
+                        ui.label(format!(
+                            "{} · revision {}",
+                            snapshot.document.name, snapshot.revision
+                        ));
+                        for job in &recent_jobs {
+                            ui.label(format!(
+                                "{:?} · {} bytes · {}",
+                                job.status, job.progress_bytes, job.job_id
+                            ));
+                        }
+                        for (path, message) in &asset_browser.diagnostics {
+                            ui.label(format!("{}: {message}", path.display()));
+                        }
+                    });
+            }
+        });
+
+    egui::Panel::left("hierarchy_or_assets")
+        .frame(chrome::panel_frame())
+        .resizable(true)
+        .default_size(if ui_state.workspace == WorkspaceTab::Assets {
+            330.0
+        } else {
+            250.0
+        })
+        .min_size(190.0)
+        .show(&mut editor_ui, |ui| {
+            if ui_state.workspace == WorkspaceTab::Scene {
+                ui.horizontal(|ui| {
+                    ui.heading("Hierarchy");
+                    if chrome::icon_button(ui, Icon::Plus, false, true, "Create object").clicked() {
+                        let object =
+                            SceneObjectDocument::new(next_object_name(&objects), selection.0);
+                        match session.apply_command(
+                            SceneCommand::CreateObject {
+                                scene_id,
+                                object: object.clone(),
+                            },
+                            snapshot.revision,
+                        ) {
+                            Ok(_) => selection.0 = Some(object.id),
+                            Err(error) => ui_state.status = error,
+                        }
+                    }
+                });
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.hierarchy_search)
+                        .hint_text("Search objects")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(&scene.name)
+                        .small()
+                        .color(chrome::MUTED),
+                );
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for object in &objects {
+                        if !object
+                            .name
+                            .to_lowercase()
+                            .contains(&ui_state.hierarchy_search.to_lowercase())
+                        {
+                            continue;
+                        }
+                        let depth = hierarchy_depth(object.id, &objects);
+                        if chrome::object_row(
+                            ui,
+                            &object.name,
+                            depth,
+                            selection.0 == Some(object.id),
+                        )
+                        .clicked()
+                        {
+                            selection.0 = Some(object.id);
+                        }
+                    }
+                });
+                ui.separator();
+                if ui
+                    .add_enabled(selection.0.is_some(), egui::Button::new("Delete selected"))
+                    .clicked()
+                    && let Some(object_id) = selection.0
+                {
+                    match session.apply_command(
+                        SceneCommand::DeleteObject {
+                            scene_id,
+                            object_id,
+                        },
+                        snapshot.revision,
+                    ) {
+                        Ok(_) => selection.0 = None,
+                        Err(error) => ui_state.status = error,
+                    }
+                }
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("asset-panel-body")
+                    .show(ui, |ui| {
+                        draw_asset_browser(
+                            ui,
+                            &mut asset_browser,
+                            &jobs,
+                            &recent_jobs,
+                            &project_root,
+                        );
+                    });
             }
         });
 
     egui::Panel::right("inspector")
+        .frame(chrome::panel_frame())
         .resizable(true)
-        .default_size(290.0)
+        .default_size(300.0)
+        .min_size(260.0)
         .show(&mut editor_ui, |ui| {
             ui.heading("Inspector");
             ui.separator();
@@ -252,45 +457,389 @@ fn draw_document_editor(
                 .0
                 .and_then(|id| objects.iter().find(|object| object.id == id))
             {
-                draw_inspector(
-                    ui,
-                    &session,
-                    &mut ui_state,
-                    scene_id,
-                    snapshot.revision,
-                    object,
-                );
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    draw_inspector(
+                        ui,
+                        &session,
+                        &mut ui_state,
+                        scene_id,
+                        snapshot.revision,
+                        object,
+                        &asset_browser.records,
+                    );
+                });
             } else {
-                ui.label("Select an object to inspect it.");
+                ui.add_space(24.0);
+                ui.label("No object selected");
+                ui.weak("Choose an object in the hierarchy to edit its properties.");
             }
         });
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE)
+        .frame(chrome::panel_frame())
         .show(&mut editor_ui, |ui| {
             ui.horizontal(|ui| {
-                for (mode, label) in [
-                    (GizmoMode::Move, "Move"),
-                    (GizmoMode::Rotate, "Rotate"),
-                    (GizmoMode::Scale, "Scale"),
-                ] {
-                    if ui
-                        .selectable_label(ui_state.gizmo_mode == mode, label)
-                        .clicked()
-                    {
-                        ui_state.gizmo_mode = mode;
-                    }
-                }
+                chrome::tab(
+                    ui,
+                    &format!(
+                        "{}.scene{}",
+                        scene.name,
+                        if snapshot.dirty { " *" } else { "" }
+                    ),
+                    true,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("{} objects", objects.len()));
+                });
             });
             ui.separator();
-            ui.label(format!("{} · {} objects", scene.name, objects.len()));
-            ui.label("Viewport preview uses placeholder cubes for scene objects.");
-            draw_gizmo(ui, &session, &mut selection, &mut ui_state, scene_id);
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.label(&ui_state.status);
+            ui.horizontal(|ui| {
+                ui.label("Perspective");
+                ui.separator();
+                ui.weak("Scene view");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak("Y up");
+                });
             });
+            let available = ui.available_size().max(egui::vec2(96.0, 96.0));
+            let response =
+                ui.add(egui::Image::new((viewport.texture_id, available)).corner_radius(7));
+            viewport.desired_points = Vec2::new(response.rect.width(), response.rect.height());
+            let rail = egui::Rect::from_min_size(
+                response.rect.min + egui::vec2(10.0, 10.0),
+                egui::vec2(42.0, 164.0),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rail)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(chrome::PANEL)
+                        .stroke(egui::Stroke::new(1.0, chrome::BORDER))
+                        .corner_radius(8)
+                        .inner_margin(4)
+                        .show(ui, |ui| {
+                            for (mode, icon, hint) in [
+                                (GizmoMode::Select, Icon::Select, "Select"),
+                                (GizmoMode::Move, Icon::Move, "Move"),
+                                (GizmoMode::Rotate, Icon::Rotate, "Rotate"),
+                                (GizmoMode::Scale, Icon::Scale, "Scale"),
+                            ] {
+                                if chrome::icon_button(
+                                    ui,
+                                    icon,
+                                    ui_state.gizmo_mode == mode,
+                                    true,
+                                    hint,
+                                )
+                                .clicked()
+                                {
+                                    ui_state.gizmo_mode = mode;
+                                }
+                            }
+                        });
+                },
+            );
+            if selection.0.is_some() && ui_state.gizmo_mode != GizmoMode::Select {
+                let controls = egui::Rect::from_min_size(
+                    response.rect.left_bottom() + egui::vec2(62.0, -70.0),
+                    egui::vec2(260.0, 60.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(controls), |ui| {
+                    egui::Frame::new()
+                        .fill(chrome::PANEL)
+                        .corner_radius(8)
+                        .inner_margin(8)
+                        .show(ui, |ui| {
+                            draw_gizmo(ui, &session, &mut selection, &mut ui_state, scene_id);
+                        });
+                });
+            }
         });
     Ok(())
+}
+
+fn draw_asset_browser(
+    ui: &mut egui::Ui,
+    browser: &mut AssetBrowserState,
+    jobs: &AssetJobService,
+    recent_jobs: &[AssetJobSnapshot],
+    project_root: &std::path::Path,
+) {
+    ui.horizontal(|ui| {
+        ui.heading("Asset Library");
+        if ui.button("↻").on_hover_text("Refresh asset list").clicked() {
+            refresh_asset_catalog(browser, project_root);
+        }
+    });
+    ui.add(
+        egui::TextEdit::singleline(&mut browser.import_path)
+            .hint_text("File path: GLB, PNG, JPEG or WAV"),
+    );
+    let import_clicked = ui.button("Import file").clicked();
+    if import_clicked {
+        let path = std::path::PathBuf::from(browser.import_path.trim());
+        if path.as_os_str().is_empty() {
+            browser.message = "Enter a source file path or drop a file onto the editor.".into();
+        } else {
+            start_local_asset_job(browser, jobs, project_root, &path);
+        }
+    }
+    ui.collapsing("Import from URL", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut browser.url_input).hint_text("https://.../asset.glb"),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut browser.author_input).hint_text("Author (optional)"),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut browser.license_input).hint_text("License (optional)"),
+        );
+        if ui.button("Download and import").clicked() {
+            let url = browser.url_input.trim().to_owned();
+            let author = nonempty_option(&browser.author_input);
+            let license = nonempty_option(&browser.license_input);
+            match jobs.start_url_import(project_root.to_path_buf(), url, author, license) {
+                Ok(job_id) => browser.message = format!("URL import job queued: {job_id}"),
+                Err(error) => browser.message = format!("Could not start URL import: {error}"),
+            }
+        }
+    });
+    ui.separator();
+    ui.add(egui::TextEdit::singleline(&mut browser.search).hint_text("Search assets"));
+    let filtered = browser
+        .records
+        .iter()
+        .filter(|record| {
+            record
+                .metadata
+                .source_path
+                .to_ascii_lowercase()
+                .contains(&browser.search.to_ascii_lowercase())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    ui.label(format!("{} assets", filtered.len()));
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .show(ui, |ui| {
+            for record in &filtered {
+                let name = std::path::Path::new(&record.metadata.source_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&record.metadata.source_path);
+                let label = format!(
+                    "{}  {}  ·  {}",
+                    asset_status_label(record.status),
+                    name,
+                    asset_kind_label(record.metadata.kind)
+                );
+                if ui
+                    .selectable_label(browser.selected == Some(record.metadata.asset_id), label)
+                    .clicked()
+                {
+                    browser.selected = Some(record.metadata.asset_id);
+                }
+            }
+        });
+    if let Some(selected) = browser
+        .selected
+        .and_then(|id| {
+            browser
+                .records
+                .iter()
+                .find(|record| record.metadata.asset_id == id)
+        })
+        .cloned()
+    {
+        ui.separator();
+        ui.label(format!("Asset ID  {}", selected.metadata.asset_id.0));
+        ui.label(format!("Source  {}", selected.metadata.source_path));
+        ui.label(format!(
+            "Importer  {} v{}",
+            selected.metadata.importer_id, selected.metadata.importer_version
+        ));
+        ui.label(format!(
+            "License  {}",
+            selected.metadata.license.as_deref().unwrap_or("Unknown")
+        ));
+        ui.add(
+            egui::TextEdit::singleline(&mut browser.reimport_path)
+                .hint_text("Optional replacement source path"),
+        );
+        if ui
+            .add_enabled(
+                selected.status == AssetStatus::Ready,
+                egui::Button::new("Reimport from project source"),
+            )
+            .clicked()
+        {
+            let source_path = nonempty_option(&browser.reimport_path).map(std::path::PathBuf::from);
+            match jobs.start_reimport(
+                project_root.to_path_buf(),
+                selected.metadata.asset_id,
+                source_path,
+            ) {
+                Ok(job_id) => browser.message = format!("Reimport job queued: {job_id}"),
+                Err(error) => browser.message = format!("Could not start reimport: {error}"),
+            }
+        }
+    }
+    if !recent_jobs.is_empty() {
+        ui.separator();
+        ui.label("Asset jobs");
+        for job in recent_jobs {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} · {} · {} B",
+                    job.operation,
+                    asset_job_status_label(job.status),
+                    job.progress_bytes
+                ));
+                if matches!(job.status, AssetJobStatus::Queued | AssetJobStatus::Running)
+                    && ui.small_button("Cancel").clicked()
+                    && let Err(error) = jobs.cancel(job.job_id)
+                {
+                    browser.message = error;
+                }
+            });
+            if let Some(message) = &job.message {
+                ui.small(format!("{}: {message}", job.job_id));
+            }
+        }
+    }
+    if !browser.message.is_empty() {
+        ui.separator();
+        ui.label(&browser.message);
+    }
+    for (path, message) in browser.diagnostics.iter().take(5) {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            format!("{}: {message}", path.display()),
+        );
+    }
+}
+
+fn refresh_asset_catalog(browser: &mut AssetBrowserState, project_root: &std::path::Path) {
+    let catalog = AssetCatalog::scan(project_root);
+    browser.records = catalog.assets;
+    browser.diagnostics = catalog
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| (diagnostic.path, diagnostic.message))
+        .collect();
+    if browser.selected.is_some_and(|id| {
+        !browser
+            .records
+            .iter()
+            .any(|record| record.metadata.asset_id == id)
+    }) {
+        browser.selected = None;
+    }
+}
+
+fn start_local_asset_job(
+    browser: &mut AssetBrowserState,
+    jobs: &AssetJobService,
+    project_root: &std::path::Path,
+    source_path: &std::path::Path,
+) {
+    match jobs.start_local_import(project_root.to_path_buf(), source_path.to_path_buf()) {
+        Ok(job_id) => browser.message = format!("Import job queued: {job_id}"),
+        Err(error) => browser.message = format!("Could not start import: {error}"),
+    }
+}
+
+fn nonempty_option(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn asset_job_status_label(status: AssetJobStatus) -> &'static str {
+    match status {
+        AssetJobStatus::Queued => "Queued",
+        AssetJobStatus::Running => "Running",
+        AssetJobStatus::Succeeded => "Succeeded",
+        AssetJobStatus::Failed => "Failed",
+        AssetJobStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn asset_status_label(status: AssetStatus) -> &'static str {
+    match status {
+        AssetStatus::Ready => "● Ready",
+        AssetStatus::Missing => "! Missing",
+        AssetStatus::Conflict => "! ID conflict",
+    }
+}
+
+fn asset_kind_label(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Model => "Model",
+        AssetKind::Texture => "Texture",
+        AssetKind::Audio => "Audio",
+    }
+}
+
+#[cfg(test)]
+mod asset_ui_tests {
+    use super::*;
+    use std::{thread, time::Instant};
+
+    struct TestProject(std::path::PathBuf);
+
+    impl TestProject {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("quasar-editor-assets-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("temporary project directory can be created");
+            Self(root)
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn asset_panel_import_action_publishes_and_refreshes_catalog() {
+        let project = TestProject::new();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/stage0-player/assets/Quasar/viewport-prop.glb");
+        let jobs = AssetJobService::default();
+        let mut browser = AssetBrowserState::default();
+        start_local_asset_job(&mut browser, &jobs, &project.0, &source);
+        assert!(browser.message.starts_with("Import job queued:"));
+        let job_id = browser
+            .message
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let job = jobs.get(job_id).expect("UI import job is visible");
+            match job.status {
+                AssetJobStatus::Succeeded => break,
+                AssetJobStatus::Failed | AssetJobStatus::Cancelled => {
+                    panic!("UI import job did not succeed: {job:?}")
+                }
+                AssetJobStatus::Queued | AssetJobStatus::Running => {}
+            }
+            assert!(Instant::now() < deadline, "UI import job timed out");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        refresh_asset_catalog(&mut browser, &project.0);
+        assert_eq!(browser.records.len(), 1);
+        assert_eq!(browser.records[0].status, AssetStatus::Ready);
+        assert_eq!(browser.records[0].metadata.kind, AssetKind::Model);
+    }
 }
 
 #[allow(clippy::collapsible_if)]
@@ -301,6 +850,7 @@ fn draw_inspector(
     scene_id: SceneId,
     revision: u64,
     object: &SceneObjectDocument,
+    assets: &[AssetRecord],
 ) {
     let object_id = object.id;
     let current_name = state
@@ -310,7 +860,11 @@ fn draw_inspector(
         .map(|(_, name)| name.clone())
         .unwrap_or_else(|| object.name.clone());
     let mut name = current_name;
-    let response = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Object name"));
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut name)
+            .hint_text("Object name")
+            .desired_width(f32::INFINITY),
+    );
     state.name_edit = Some((object_id, name.clone()));
     if response.lost_focus() && name != object.name {
         match session.apply_command(
@@ -325,11 +879,68 @@ fn draw_inspector(
             Err(error) => state.status = error,
         }
     }
-    ui.label(format!("ID  {}", object_id.0));
+    if state.advanced {
+        ui.label(
+            egui::RichText::new(format!("ID  {}", object_id.0))
+                .small()
+                .color(chrome::MUTED),
+        );
+    }
     ui.separator();
+    ui.strong("Model");
+    let assigned_model = ModelAssetComponent::from_components(&object.components)
+        .ok()
+        .flatten()
+        .map(|reference| reference.asset_id);
+    let mut next_model = assigned_model;
+    egui::ComboBox::from_id_salt(("model-asset", object_id))
+        .selected_text(
+            assigned_model
+                .and_then(|asset_id| {
+                    assets.iter().find(|asset| {
+                        asset.metadata.asset_id == asset_id
+                            && asset.metadata.kind == AssetKind::Model
+                    })
+                })
+                .and_then(|asset| {
+                    std::path::Path::new(&asset.metadata.source_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                })
+                .unwrap_or("None"),
+        )
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next_model, None, "None");
+            for asset in assets.iter().filter(|asset| {
+                asset.metadata.kind == AssetKind::Model && asset.status == AssetStatus::Ready
+            }) {
+                ui.selectable_value(
+                    &mut next_model,
+                    Some(asset.metadata.asset_id),
+                    &asset.metadata.source_path,
+                );
+            }
+        });
+    if next_model != assigned_model {
+        match session.apply_command(
+            SceneCommand::AssignModelAsset {
+                scene_id,
+                object_id,
+                asset_id: next_model,
+            },
+            revision,
+        ) {
+            Ok(_) => state.status = "Updated model asset".into(),
+            Err(error) => state.status = error,
+        }
+        return;
+    }
     let mut transform = object.local_transform;
     let mut interaction = TransformEditInteraction::default();
-    ui.label("Translation");
+    ui.add_space(12.0);
+    ui.separator();
+    ui.strong("Transform");
+    ui.label("Position");
     interaction.merge(vector3_controls(ui, &mut transform.translation));
     ui.label("Rotation · quaternion");
     interaction.merge(vector4_controls(ui, &mut transform.rotation_xyzw));
@@ -400,7 +1011,13 @@ fn vector3_controls(ui: &mut egui::Ui, value: &mut [f32; 3]) -> TransformEditInt
     let mut interaction = TransformEditInteraction::default();
     ui.horizontal(|ui| {
         for index in 0..3 {
-            ui.label(["X", "Y", "Z"][index]);
+            ui.label(egui::RichText::new(["X", "Y", "Z"][index]).color(
+                [
+                    egui::Color32::from_rgb(215, 116, 107),
+                    egui::Color32::from_rgb(137, 183, 125),
+                    egui::Color32::from_rgb(121, 161, 209),
+                ][index],
+            ));
             let response = ui.add(
                 egui::DragValue::new(&mut value[index])
                     .speed(0.05)
@@ -441,8 +1058,11 @@ fn draw_gizmo(
     state: &mut UiState,
     scene_id: SceneId,
 ) {
-    ui.add_space(12.0);
-    ui.label("Transform gizmo");
+    ui.label(
+        egui::RichText::new(format!("{:?} · drag an axis", state.gizmo_mode))
+            .small()
+            .color(chrome::MUTED),
+    );
     ui.horizontal(|ui| {
         for (axis, color) in [
             (0, egui::Color32::from_rgb(220, 80, 80)),
@@ -450,8 +1070,9 @@ fn draw_gizmo(
             (2, egui::Color32::from_rgb(90, 150, 240)),
         ] {
             let response = ui.add(
-                egui::Button::new(["X axis", "Y axis", "Z axis"][axis])
-                    .fill(color)
+                egui::Button::new(egui::RichText::new(["X", "Y", "Z"][axis]).color(color))
+                    .fill(chrome::FIELD)
+                    .min_size(egui::vec2(50.0, 28.0))
                     .sense(egui::Sense::drag()),
             );
             if response.drag_started() {
@@ -481,6 +1102,7 @@ fn draw_gizmo(
                             let mut transform = object.local_transform;
                             let delta = (response.drag_delta().x - response.drag_delta().y) * 0.01;
                             match state.gizmo_mode {
+                                GizmoMode::Select => {}
                                 GizmoMode::Move => transform.translation[axis] += delta,
                                 GizmoMode::Scale => {
                                     transform.scale[axis] =

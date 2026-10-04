@@ -29,6 +29,7 @@ use quasar_runtime::{
 };
 
 use super::project_probe::EditorProject;
+use crate::editor_style::{self as chrome, Icon};
 
 const BENCHMARK_WARMUP_SECONDS: f64 = 5.0;
 const BENCHMARK_SAMPLE_SECONDS: f64 = 60.0;
@@ -86,6 +87,8 @@ struct AnimationWorkspaceUi {
     selected_key_time: f32,
     key_translation: [f32; 3],
     key_yaw_degrees: f32,
+    advanced: bool,
+    console_open: bool,
 }
 
 impl Default for AnimationWorkspaceUi {
@@ -95,6 +98,8 @@ impl Default for AnimationWorkspaceUi {
             selected_key_time: 0.0,
             key_translation: [1.35, 1.02, -2.82],
             key_yaw_degrees: 0.0,
+            advanced: false,
+            console_open: false,
         }
     }
 }
@@ -139,7 +144,7 @@ fn setup_viewport_probe(
         Camera3d::default(),
         Camera {
             order: -1,
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.055, 0.075, 0.11)),
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.11, 0.11, 0.12)),
             ..default()
         },
         RenderTarget::Image(image.into()),
@@ -265,6 +270,7 @@ fn draw_editor_shell(
     scene_camera: Single<(&Camera, &GlobalTransform), With<SceneViewportCamera>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    chrome::install(ctx);
     let mut viewport_ui = egui::Ui::new(
         ctx.clone(),
         "quasar_editor_viewport".into(),
@@ -273,18 +279,15 @@ fn draw_editor_shell(
             .max_rect(ctx.viewport_rect()),
     );
 
-    egui::Panel::top("quasar_toolbar").show(&mut viewport_ui, |ui| {
+    egui::Panel::top("quasar_toolbar").frame(chrome::toolbar_frame()).show(&mut viewport_ui, |ui| {
         ui.horizontal(|ui| {
-            ui.heading("Quasar Engine");
-            ui.separator();
-            ui.label("Stage 0 · Animation workflow probe");
-            if ui.small_button("Save").clicked() {
-                match project.save() {
-                    Ok(()) => {}
-                    Err(error) => project.status = error,
-                }
+            if chrome::tab(ui, "Scene", workspace_ui.tab == EditorWorkspaceTab::Scene).clicked() {
+                workspace_ui.tab = EditorWorkspaceTab::Scene;
             }
-            if ui.small_button("Reload").clicked() {
+            ui.add_enabled(false, egui::Button::new("Code").min_size(egui::vec2(90.0, 34.0))).on_hover_text("Code workspace is planned.");
+            ui.add_enabled(false, egui::Button::new("Assets").min_size(egui::vec2(90.0, 34.0))).on_hover_text("The asset library is available in ProjectDocument mode.");
+            chrome::icon_button(ui, Icon::Plus, false, false, "Additional workspaces are planned.");
+            if ui.button("Reload").on_hover_text("Reload the Stage 0 snapshot").clicked() {
                 match project.reload() {
                     Ok(()) => {
                         animation_data.animation = project.snapshot.scene.animation.clone();
@@ -297,40 +300,63 @@ fn draw_editor_shell(
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format!("DPI {:.0}%", window.scale_factor() * 100.0));
+                if ui.selectable_label(workspace_ui.advanced, "Advanced").clicked() { workspace_ui.advanced = true; }
+                if ui.selectable_label(!workspace_ui.advanced, "Basic").clicked() { workspace_ui.advanced = false; }
+                ui.separator();
+                ui.add_enabled(false, egui::Button::new("Advisor")).on_hover_text("Advisor rules are planned.");
+                chrome::icon_button(ui, Icon::Play, false, false, "This technical scene is already running; separate Play controls are planned.");
+                ui.separator();
+                chrome::icon_button(ui, Icon::Redo, false, false, "Undo/Redo is available in ProjectDocument mode.");
+                chrome::icon_button(ui, Icon::Undo, false, false, "Undo/Redo is available in ProjectDocument mode.");
+                if chrome::icon_button(ui, Icon::Save, false, true, "Save snapshot").clicked() && let Err(error) = project.save() { project.status = error; }
             });
         });
     });
 
-    egui::Panel::top("quasar_workspace_tabs").show(&mut viewport_ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut workspace_ui.tab, EditorWorkspaceTab::Scene, "Scene");
-            ui.selectable_value(
-                &mut workspace_ui.tab,
-                EditorWorkspaceTab::SceneTimeline,
-                "Scene Timeline",
-            );
-            ui.selectable_value(
-                &mut workspace_ui.tab,
-                EditorWorkspaceTab::ClipPreview,
-                "Clip Preview",
-            );
-            ui.separator();
-            ui.label(if project.dirty {
-                "Unsaved changes"
-            } else {
-                project.status.as_str()
+    egui::Panel::top("quasar_workspace_tabs")
+        .frame(chrome::toolbar_frame())
+        .show(&mut viewport_ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut workspace_ui.tab, EditorWorkspaceTab::Scene, "Scene");
+                ui.selectable_value(
+                    &mut workspace_ui.tab,
+                    EditorWorkspaceTab::SceneTimeline,
+                    "Scene Timeline",
+                );
+                ui.selectable_value(
+                    &mut workspace_ui.tab,
+                    EditorWorkspaceTab::ClipPreview,
+                    "Clip Preview",
+                );
+                ui.separator();
+                ui.weak("Animation workspace");
             });
         });
+
+    egui::Panel::bottom("quasar_console").frame(chrome::panel_frame()).show(&mut viewport_ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.selectable_label(workspace_ui.console_open, "Console").clicked() { workspace_ui.console_open = !workspace_ui.console_open; }
+            ui.label(egui::RichText::new(&project.status).small().color(chrome::MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(if project.dirty { "Unsaved changes" } else { "Saved" }).small().color(if project.dirty { chrome::ACCENT } else { chrome::MUTED }));
+            });
+        });
+        if workspace_ui.console_open {
+            ui.separator();
+            ui.weak("Stage 0 · runtime and animation preview");
+            ui.label("WASD / Space · move     E · interact     F10 · stop audio     F9 · restart audio");
+        }
     });
 
     egui::Panel::left("quasar_hierarchy")
-        .default_size(205.0)
+        .frame(chrome::panel_frame())
+        .default_size(250.0)
+        .min_size(190.0)
         .resizable(true)
         .show(&mut viewport_ui, |ui| {
             ui.heading("Hierarchy");
             ui.separator();
-            ui.label("Scene");
+            ui.weak("Room.scene");
             ui.indent("scene_root", |ui| {
                 ui.label("Room");
                 ui.indent("room_children", |ui| {
@@ -345,7 +371,9 @@ fn draw_editor_shell(
         });
 
     egui::Panel::right("quasar_inspector")
-        .default_size(235.0)
+        .frame(chrome::panel_frame())
+        .default_size(300.0)
+        .min_size(240.0)
         .resizable(true)
         .show(&mut viewport_ui, |ui| {
             ui.heading("Inspector");
@@ -358,16 +386,20 @@ fn draw_editor_shell(
                 ui.label("Nothing selected");
                 ui.label("Click the orange prop in the viewport.");
             }
-            ui.add_space(12.0);
-            ui.label("Render target");
-            ui.monospace(format!(
-                "{} × {} px",
-                viewport.physical_size.x, viewport.physical_size.y
-            ));
+            if workspace_ui.advanced {
+                ui.add_space(12.0);
+                ui.label("Render target");
+                ui.monospace(format!(
+                    "{} × {} px",
+                    viewport.physical_size.x, viewport.physical_size.y
+                ));
+                ui.weak(format!("DPI {:.0}%", window.scale_factor() * 100.0));
+            }
         });
 
     if workspace_ui.tab == EditorWorkspaceTab::SceneTimeline {
         egui::Panel::bottom("quasar_animation_timeline")
+            .frame(chrome::panel_frame())
             .default_size(230.0)
             .resizable(true)
             .show(&mut viewport_ui, |ui| {
@@ -381,6 +413,7 @@ fn draw_editor_shell(
             });
     } else if workspace_ui.tab == EditorWorkspaceTab::ClipPreview {
         egui::Panel::bottom("quasar_animation_clip_preview")
+            .frame(chrome::panel_frame())
             .default_size(170.0)
             .resizable(true)
             .show(&mut viewport_ui, |ui| {
@@ -388,59 +421,134 @@ fn draw_editor_shell(
             });
     }
 
-    egui::CentralPanel::default().show(&mut viewport_ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.strong(match workspace_ui.tab {
-                EditorWorkspaceTab::Scene => "Scene",
-                EditorWorkspaceTab::SceneTimeline => "Scene Timeline · Door animation",
-                EditorWorkspaceTab::ClipPreview => "Clip Preview · GLB character",
+    egui::CentralPanel::default()
+        .frame(chrome::panel_frame())
+        .show(&mut viewport_ui, |ui| {
+            ui.horizontal(|ui| {
+                chrome::tab(
+                    ui,
+                    if project.dirty {
+                        "Room.scene *"
+                    } else {
+                        "Room.scene"
+                    },
+                    true,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak("Stage 0");
+                });
             });
             ui.separator();
-            ui.label("WASD / Space · E door");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Stop").clicked() {
-                    audio_controls.pending = Some(AudioProbeCommand::Stop);
-                }
-                if ui.small_button("Restart ambience").clicked() {
-                    audio_controls.pending = Some(AudioProbeCommand::Restart);
-                }
-                ui.label(if audio_state.ambience_active {
-                    "Ambience: on"
-                } else {
-                    "Ambience: off"
+            ui.horizontal(|ui| {
+                ui.strong(match workspace_ui.tab {
+                    EditorWorkspaceTab::Scene => "Perspective",
+                    EditorWorkspaceTab::SceneTimeline => "Scene Timeline · Door animation",
+                    EditorWorkspaceTab::ClipPreview => "Clip Preview · GLB character",
                 });
                 ui.separator();
-                ui.label("F10 Stop · F9 Restart");
-            });
-        });
-        ui.add_space(6.0);
-        let available = ui.available_size().max(egui::vec2(96.0, 96.0));
-        let response =
-            ui.add(egui::Image::new((viewport.texture_id, available)).sense(egui::Sense::click()));
-        viewport.desired_points = Vec2::new(response.rect.width(), response.rect.height());
-        viewport_focus.0 = response.hovered();
-
-        if response.clicked()
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            let uv = (pointer - response.rect.min) / response.rect.size();
-            let physical_position = Vec2::new(
-                uv.x * viewport.physical_size.x as f32,
-                uv.y * viewport.physical_size.y as f32,
-            );
-            let (camera, transform) = *scene_camera;
-            selection.prop_selected = camera
-                .viewport_to_world(transform, physical_position)
-                .is_ok_and(|ray| {
-                    ray_intersects_aabb(
-                        ray.origin,
-                        ray.direction.as_vec3(),
-                        Vec3::new(-0.75, 0.10, -0.58),
-                        Vec3::new(0.75, 1.95, 0.58),
-                    )
+                ui.label("WASD / Space · E door");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Stop").clicked() {
+                        audio_controls.pending = Some(AudioProbeCommand::Stop);
+                    }
+                    if ui.small_button("Restart ambience").clicked() {
+                        audio_controls.pending = Some(AudioProbeCommand::Restart);
+                    }
+                    ui.label(if audio_state.ambience_active {
+                        "Ambience: on"
+                    } else {
+                        "Ambience: off"
+                    });
+                    ui.separator();
+                    ui.label("F10 Stop · F9 Restart");
                 });
-        }
-    });
+            });
+            ui.add_space(6.0);
+            let available = ui.available_size().max(egui::vec2(96.0, 96.0));
+            let response = ui.add(
+                egui::Image::new((viewport.texture_id, available))
+                    .corner_radius(7)
+                    .sense(egui::Sense::click()),
+            );
+            viewport.desired_points = Vec2::new(response.rect.width(), response.rect.height());
+            viewport_focus.0 = response.hovered();
+
+            let rail = egui::Rect::from_min_size(
+                response.rect.min + egui::vec2(10.0, 10.0),
+                egui::vec2(42.0, 164.0),
+            );
+            let rail_response = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rail)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(chrome::PANEL)
+                        .stroke(egui::Stroke::new(1.0, chrome::BORDER))
+                        .corner_radius(8)
+                        .inner_margin(4)
+                        .show(ui, |ui| {
+                            chrome::icon_button(
+                                ui,
+                                Icon::Select,
+                                true,
+                                true,
+                                "Select a prop in the viewport",
+                            );
+                            chrome::icon_button(
+                                ui,
+                                Icon::Move,
+                                false,
+                                false,
+                                "Transform tools are available in ProjectDocument mode.",
+                            );
+                            chrome::icon_button(
+                                ui,
+                                Icon::Rotate,
+                                false,
+                                false,
+                                "Transform tools are available in ProjectDocument mode.",
+                            );
+                            chrome::icon_button(
+                                ui,
+                                Icon::Scale,
+                                false,
+                                false,
+                                "Transform tools are available in ProjectDocument mode.",
+                            );
+                        });
+                },
+            );
+            if rail_response
+                .response
+                .rect
+                .contains(ctx.pointer_hover_pos().unwrap_or_default())
+            {
+                viewport_focus.0 = false;
+            }
+
+            if response.clicked()
+                && !rail.contains(response.interact_pointer_pos().unwrap_or_default())
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let uv = (pointer - response.rect.min) / response.rect.size();
+                let physical_position = Vec2::new(
+                    uv.x * viewport.physical_size.x as f32,
+                    uv.y * viewport.physical_size.y as f32,
+                );
+                let (camera, transform) = *scene_camera;
+                selection.prop_selected = camera
+                    .viewport_to_world(transform, physical_position)
+                    .is_ok_and(|ray| {
+                        ray_intersects_aabb(
+                            ray.origin,
+                            ray.direction.as_vec3(),
+                            Vec3::new(-0.75, 0.10, -0.58),
+                            Vec3::new(0.75, 1.95, 0.58),
+                        )
+                    });
+            }
+        });
 
     Ok(())
 }

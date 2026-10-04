@@ -80,7 +80,7 @@ fn serve_stdio() -> Result<(), String> {
                     "protocolVersion": if supported_protocol_version(requested) { requested } else { PROTOCOL_VERSION },
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                    "instructions": "Controlled access to the ProjectDocument currently opened in Quasar Editor. Preview scene edits before applying them; every write uses the current expected_revision."
+                    "instructions": "Controlled access to the ProjectDocument and asset catalog currently open in Quasar Editor. Asset imports and reimports return job IDs; poll get_asset_job and cancel with cancel_asset_job."
                 }))
             }
             "notifications/initialized" => continue,
@@ -171,6 +171,41 @@ fn tools_list() -> Value {
                 "name": "save_project",
                 "description": "Save the open ProjectDocument after checking expected_revision.",
                 "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 } }, "required": ["expected_revision"], "additionalProperties": false }
+            },
+            {
+                "name": "list_assets",
+                "description": "List imported assets and catalog diagnostics for the project open in Quasar Editor.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            },
+            {
+                "name": "start_asset_import",
+                "description": "Start a cancellable local asset import job for a GLB, PNG, JPEG or WAV file.",
+                "inputSchema": { "type": "object", "properties": { "source_path": { "type": "string" } }, "required": ["source_path"], "additionalProperties": false }
+            },
+            {
+                "name": "start_asset_import_url",
+                "description": "Start a direct HTTP(S) asset download and import job. Private or local network hosts are rejected.",
+                "inputSchema": { "type": "object", "properties": { "url": { "type": "string", "format": "uri" }, "author": { "type": "string" }, "license": { "type": "string" } }, "required": ["url"], "additionalProperties": false }
+            },
+            {
+                "name": "start_asset_reimport",
+                "description": "Revalidate and reimport an asset by stable AssetId while preserving the last successful file on failure.",
+                "inputSchema": { "type": "object", "properties": { "asset_id": { "type": "string", "format": "uuid" }, "source_path": { "type": "string", "description": "Optional replacement source file. Required for assets without a stored source URL." } }, "required": ["asset_id"], "additionalProperties": false }
+            },
+            {
+                "name": "get_asset_job",
+                "description": "Read progress and final status for an asset import or reimport job.",
+                "inputSchema": { "type": "object", "properties": { "job_id": { "type": "string", "format": "uuid" } }, "required": ["job_id"], "additionalProperties": false }
+            },
+            {
+                "name": "cancel_asset_job",
+                "description": "Cancel a queued or running asset operation.",
+                "inputSchema": { "type": "object", "properties": { "job_id": { "type": "string", "format": "uuid" } }, "required": ["job_id"], "additionalProperties": false }
+            },
+            {
+                "name": "assign_model_asset",
+                "description": "Assign a ready model asset to an object or clear its model assignment. The change is undoable and requires the current revision.",
+                "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "scene_id": { "type": "string", "format": "uuid" }, "object_id": { "type": "string", "format": "uuid" }, "asset_id": { "type": ["string", "null"], "format": "uuid" } }, "required": ["expected_revision", "scene_id", "object_id", "asset_id"], "additionalProperties": false }
             }
         ]
     })
@@ -195,7 +230,14 @@ fn call_tool(request: &Value, manifest_path: &PathBuf) -> Result<Value, (i64, St
         | "apply_scene_command"
         | "undo"
         | "redo"
-        | "save_project" => query_editor(manifest_path, name, &arguments),
+        | "save_project"
+        | "list_assets"
+        | "start_asset_import"
+        | "start_asset_import_url"
+        | "start_asset_reimport"
+        | "get_asset_job"
+        | "cancel_asset_job"
+        | "assign_model_asset" => query_editor(manifest_path, name, &arguments),
         "get_scene" => {
             let scene_id = arguments
                 .get("scene_id")

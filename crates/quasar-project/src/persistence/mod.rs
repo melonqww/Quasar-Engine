@@ -80,6 +80,25 @@ fn temporary_path(destination: &Path, parent: &Path, label: &str) -> Result<Path
     )))
 }
 
+/// Atomically replaces one published file with a complete staged file on the same volume.
+pub fn replace_file_from_staging(
+    staged: &Path,
+    destination: &Path,
+    label: &str,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    let result = replace_file_windows(staged, destination);
+    #[cfg(not(windows))]
+    let result = fs::rename(staged, destination);
+    result.map_err(|error| {
+        format!(
+            "cannot publish staged {label} {} over {}: {error}",
+            staged.display(),
+            destination.display()
+        )
+    })
+}
+
 #[cfg(windows)]
 fn replace_file_windows(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::{ffi::OsStr, os::windows::ffi::OsStrExt};

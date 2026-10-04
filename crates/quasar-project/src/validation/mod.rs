@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::assets::ModelAssetComponent;
 use crate::document::{PROJECT_DOCUMENT_VERSION, ProjectDocument, SCENE_DOCUMENT_VERSION};
 
 pub fn validate_project(project: &ProjectDocument) -> Result<(), String> {
@@ -58,6 +59,12 @@ pub fn validate_project(project: &ProjectDocument) -> Result<(), String> {
                     ));
                 }
             }
+            ModelAssetComponent::from_components(&object.components).map_err(|error| {
+                format!(
+                    "object '{}' has an invalid model asset reference: {error}",
+                    object.id.0
+                )
+            })?;
             scene_objects.insert(object.id, object.parent_id);
         }
         for object in &scene.objects {

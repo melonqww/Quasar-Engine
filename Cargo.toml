@@ -27,6 +27,7 @@ mlua = { version = "=0.12.1", features = ["lua54", "vendored"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 uuid = { version = "=1.26.1", features = ["serde", "v4"] }
+url = "=2.5.8"
 quasar-project = { path = "crates/quasar-project" }
 quasar-runtime = { path = "crates/quasar-runtime" }
 quasar-mcp = { path = "crates/quasar-mcp" }

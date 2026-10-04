@@ -4892,6 +4892,7 @@ dependencies = [
  "quasar-runtime",
  "serde",
  "serde_json",
+ "url",
  "uuid",
 ]
 

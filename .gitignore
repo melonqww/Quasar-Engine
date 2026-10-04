@@ -1,4 +1,5 @@
 /target/
+/.quasar/
 
 # Internal architecture, planning, and work logs stay out of public commits.
 /Architecture/

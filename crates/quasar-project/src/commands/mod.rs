@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::assets::{AssetId, MODEL_COMPONENT_TYPE_ID, ModelAssetComponent};
 use crate::document::{
     ObjectId, ProjectDocument, SceneDocument, SceneId, SceneObjectDocument, TransformDocument,
 };
@@ -33,6 +34,11 @@ pub enum SceneCommand {
         object_id: ObjectId,
         parent_id: Option<ObjectId>,
     },
+    AssignModelAsset {
+        scene_id: SceneId,
+        object_id: ObjectId,
+        asset_id: Option<AssetId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +55,8 @@ impl SceneCommand {
             | Self::DeleteObject { scene_id, .. }
             | Self::RenameObject { scene_id, .. }
             | Self::SetTransform { scene_id, .. }
-            | Self::ReparentObject { scene_id, .. } => *scene_id,
+            | Self::ReparentObject { scene_id, .. }
+            | Self::AssignModelAsset { scene_id, .. } => *scene_id,
         }
     }
 
@@ -60,6 +67,7 @@ impl SceneCommand {
             Self::RenameObject { .. } => "Rename Object",
             Self::SetTransform { .. } => "Set Transform",
             Self::ReparentObject { .. } => "Reparent Object",
+            Self::AssignModelAsset { .. } => "Assign Model Asset",
         }
     }
 
@@ -113,6 +121,25 @@ impl SceneCommand {
             } => {
                 let object = find_object_mut(scene, *object_id)?;
                 object.parent_id = *parent_id;
+                vec![*object_id]
+            }
+            Self::AssignModelAsset {
+                object_id,
+                asset_id,
+                ..
+            } => {
+                let object = find_object_mut(scene, *object_id)?;
+                object
+                    .components
+                    .retain(|component| component.type_id != MODEL_COMPONENT_TYPE_ID);
+                if let Some(asset_id) = asset_id {
+                    object.components.push(
+                        ModelAssetComponent {
+                            asset_id: *asset_id,
+                        }
+                        .into_component(),
+                    );
+                }
                 vec![*object_id]
             }
         };

@@ -18,7 +18,10 @@ use bevy_rapier3d::prelude::{
     RapierPhysicsPlugin, TimestepMode,
 };
 use quasar_project::document::{ObjectId, ProjectDocument, SceneDocument};
-use quasar_project::{ProjectSnapshot, SceneSnapshot, SnapshotObject, SnapshotObjectKind};
+use quasar_project::{
+    ProjectSnapshot, SceneSnapshot, SnapshotObject, SnapshotObjectKind,
+    assets::{AssetCatalog, AssetKind, AssetStatus, ModelAssetComponent},
+};
 use quasar_runtime::{
     animation::{
         AnimationProbeData, AnimationProbePlugin, AnimationSessionAudio, AnimationWorkspaceState,
@@ -171,10 +174,43 @@ fn resolve_project_document(path: &Path) -> Result<ResolvedDocument, String> {
         )
     })?;
     let document = ProjectDocument::load(&project_path)?;
+    validate_document_model_assets(&project_path, &document)?;
     Ok(ResolvedDocument {
         project_path,
         document,
     })
+}
+
+fn validate_document_model_assets(
+    project_path: &Path,
+    document: &ProjectDocument,
+) -> Result<(), String> {
+    let project_root = project_path
+        .parent()
+        .ok_or_else(|| "project document has no project root".to_owned())?;
+    let catalog = AssetCatalog::scan(project_root);
+    for object in document.scenes.iter().flat_map(|scene| &scene.objects) {
+        let Some(reference) = ModelAssetComponent::from_components(&object.components)? else {
+            continue;
+        };
+        let asset = catalog
+            .assets
+            .iter()
+            .find(|asset| asset.metadata.asset_id == reference.asset_id)
+            .ok_or_else(|| {
+                format!(
+                    "object '{}' references missing model asset '{}'",
+                    object.name, reference.asset_id.0
+                )
+            })?;
+        if asset.metadata.kind != AssetKind::Model || asset.status != AssetStatus::Ready {
+            return Err(format!(
+                "object '{}' references model asset '{}' in status {:?}",
+                object.name, reference.asset_id.0, asset.status
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn active_document_scene(document: &ProjectDocument) -> Result<&SceneDocument, String> {
@@ -191,16 +227,29 @@ fn launch_document_preview(
 ) -> Result<(), String> {
     let scene = active_document_scene(&document.document)?;
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: format!("{} — Quasar Player Preview", document.document.name),
-            name: Some("quasar.player.document_preview".to_owned()),
-            resolution: (1280, 800).into(),
-            resizable: true,
-            ..default()
-        }),
-        ..default()
-    }))
+    let asset_root = document
+        .project_path
+        .parent()
+        .ok_or_else(|| "project document has no project root".to_owned())?
+        .to_string_lossy()
+        .into_owned();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: format!("{} — Quasar Player Preview", document.document.name),
+                    name: Some("quasar.player.document_preview".to_owned()),
+                    resolution: (1280, 800).into(),
+                    resizable: true,
+                    ..default()
+                }),
+                ..default()
+            })
+            .set(AssetPlugin {
+                file_path: asset_root,
+                ..default()
+            }),
+    )
     .insert_resource(document.clone())
     .add_systems(Startup, setup_document_preview);
     if let Some(path) = screenshot {
@@ -221,6 +270,7 @@ fn setup_document_preview(
     document: Res<ResolvedDocument>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
 ) {
     commands.spawn((
         Camera3d::default(),
@@ -248,6 +298,12 @@ fn setup_document_preview(
         .iter()
         .map(|object| (object.id, commands.spawn_empty().id()))
         .collect::<std::collections::HashMap<_, _>>();
+    let asset_catalog = AssetCatalog::scan(
+        document
+            .project_path
+            .parent()
+            .unwrap_or_else(|| Path::new(".")),
+    );
     for object in &scene.objects {
         let Some(&entity) = entities.get(&object.id) else {
             continue;
@@ -263,13 +319,33 @@ fn setup_document_preview(
             scale: Vec3::from_array(object.local_transform.scale),
         };
         let mut entity_commands = commands.entity(entity);
-        entity_commands.insert((
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(material.clone()),
-            transform,
-            Name::new(object.name.clone()),
-            DocumentObjectId { _id: object.id },
-        ));
+        let model_path = ModelAssetComponent::from_components(&object.components)
+            .ok()
+            .flatten()
+            .and_then(|reference| {
+                asset_catalog.assets.iter().find(|asset| {
+                    asset.metadata.asset_id == reference.asset_id
+                        && asset.metadata.kind == AssetKind::Model
+                        && asset.status == AssetStatus::Ready
+                })
+            })
+            .map(|asset| asset.metadata.source_path.clone());
+        if let Some(model_path) = model_path {
+            entity_commands.insert((
+                WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(model_path))),
+                transform,
+                Name::new(object.name.clone()),
+                DocumentObjectId { _id: object.id },
+            ));
+        } else {
+            entity_commands.insert((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                transform,
+                Name::new(object.name.clone()),
+                DocumentObjectId { _id: object.id },
+            ));
+        }
         if let Some(parent_id) = object.parent_id
             && let Some(&parent) = entities.get(&parent_id)
         {
@@ -870,12 +946,13 @@ fn handle_session_audio_input(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         PlayerDoor, PlayerSessionAudio, PlayerSessionState, benchmark_route_direction,
         handle_session_audio_input, interact_with_door, parse_screenshot_argument,
         parse_snapshot_argument, percentile, read_player_input, resolve_snapshot,
+        validate_document_model_assets,
     };
     use bevy::{
         asset::{AssetApp, AssetPlugin},
@@ -885,6 +962,10 @@ mod tests {
         prelude::{App, KeyCode, MinimalPlugins, Name, PreUpdate, Quat, Transform, Update, With},
     };
     use bevy_rapier3d::prelude::Collider;
+    use quasar_project::{
+        assets::{ASSET_METADATA_VERSION, AssetId, AssetKind, AssetMetadata, ModelAssetComponent},
+        document::{ProjectDocument, SceneDocument, SceneObjectDocument},
+    };
 
     fn fixture_snapshot() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -894,6 +975,64 @@ mod tests {
     fn animation_fixture_snapshot() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/stage0-animation/quasar.snapshot.json")
+    }
+
+    struct TestProject(PathBuf);
+
+    impl TestProject {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "quasar-player-assets-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("temporary project directory can be created");
+            Self(root)
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn document_with_model(asset_id: AssetId) -> ProjectDocument {
+        let mut scene = SceneDocument::new("Main");
+        let mut object = SceneObjectDocument::new("Model", None);
+        object
+            .components
+            .push(ModelAssetComponent { asset_id }.into_component());
+        scene.objects.push(object);
+        ProjectDocument::new("Player asset test", scene)
+    }
+
+    fn write_model_metadata(project_root: &std::path::Path, asset_id: AssetId, source: &str) {
+        let metadata = AssetMetadata {
+            metadata_version: ASSET_METADATA_VERSION,
+            asset_id,
+            kind: AssetKind::Model,
+            source_path: source.to_owned(),
+            importer_id: "quasar.gltf.glb".to_owned(),
+            importer_version: 1,
+            import_settings: serde_json::json!({}),
+            source_url: None,
+            author: None,
+            license: None,
+            derived_files: Vec::new(),
+        };
+        let sidecar = project_root.join(source).with_file_name(format!(
+            "{}.meta.json",
+            Path::new(source).file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(
+            sidecar,
+            serde_json::to_vec_pretty(&metadata).expect("asset metadata serializes"),
+        )
+        .expect("asset metadata can be written");
     }
 
     #[test]
@@ -1058,6 +1197,47 @@ mod tests {
         let error = resolve_snapshot(&snapshot_path).expect_err("missing model is rejected");
         assert!(error.contains("prop model"), "unexpected error: {error}");
         std::fs::remove_dir_all(temp_root).expect("temporary files are removed");
+    }
+
+    #[test]
+    fn player_accepts_ready_model_reference_and_rejects_missing_or_conflicting_assets() {
+        let project = TestProject::new();
+        let asset_id = AssetId::new();
+        let document = document_with_model(asset_id);
+        let document_path = project.0.join("quasar.project.json");
+        document
+            .save(&document_path)
+            .expect("project document saves");
+        std::fs::create_dir_all(project.0.join("Assets/Models"))
+            .expect("asset folder can be created");
+
+        let error = validate_document_model_assets(&document_path, &document)
+            .expect_err("missing model reference prevents Player launch");
+        assert!(
+            error.contains("missing model asset"),
+            "unexpected error: {error}"
+        );
+
+        let source = "Assets/Models/model.glb";
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/stage0-player/assets/Quasar/viewport-prop.glb");
+        std::fs::copy(&fixture, project.0.join(source)).expect("valid GLB fixture copies");
+        write_model_metadata(&project.0, asset_id, source);
+        validate_document_model_assets(&document_path, &document)
+            .expect("ready model reference is accepted");
+
+        std::fs::remove_file(project.0.join(source)).expect("model source can be removed");
+        let error = validate_document_model_assets(&document_path, &document)
+            .expect_err("metadata with a missing model source prevents Player launch");
+        assert!(error.contains("Missing"), "unexpected error: {error}");
+        std::fs::copy(&fixture, project.0.join(source)).expect("model source can be restored");
+
+        let second_source = "Assets/Models/model-copy.glb";
+        std::fs::copy(&fixture, project.0.join(second_source)).expect("duplicate GLB copies");
+        write_model_metadata(&project.0, asset_id, second_source);
+        let error = validate_document_model_assets(&document_path, &document)
+            .expect_err("duplicate AssetId prevents Player launch");
+        assert!(error.contains("Conflict"), "unexpected error: {error}");
     }
 
     #[test]

@@ -1,3 +1,7 @@
 # Импорт
 
-Очередь, source validation, декодирование, staging, публикация cache, reimport, cancellation и generation tokens. Сохранять last-known-good до успешной публикации.
+Текущий локальный импорт принимает GLB 2.0, PNG/JPEG и WAV до 512 MiB. Проверяются основные заголовки и структура, для GLB требуется JSON 2.0 и запрещены внешние зависимости. Исходник и metadata сначала подготавливаются в `.quasar/staging`, затем публикуются в `Assets/Models`, `Assets/Textures` или `Assets/Audio`; конфликт имён разрешается новым именем, AssetId остаётся отдельным UUID.
+
+Локальный импорт, reimport и URL-загрузка используют `AssetJobService`: job ID, status, byte progress и отмена. Reimport принимает новый локальный source path либо для URL-ассета скачивает сохранённый source URL. Исходник в Assets подменяется только после проверки полного staged-файла; ошибки и отмена очищают staging. Прямая ссылка должна использовать HTTP(S), иметь поддерживаемое расширение и разрешаться только в публичные адреса; redirects запрещены. Системный `curl.exe` (Windows) или `curl` (прочие платформы) должен быть доступен в PATH.
+
+Этот срез ещё не реализует file watcher, generation token, decoded cache, content hash/stale tracking или восстановление после аварии в середине первичного двухфайлового publish. Первая версия UI запускает локальный импорт по указанному пути или перетаскиванием, reimport — по указанному replacement path или сохранённому URL.

@@ -604,4 +604,53 @@ mod tests {
             [2.0, 0.0, 0.0]
         );
     }
+
+    #[test]
+    fn cancel_transform_gesture_restores_document_without_adding_history() {
+        let file = TemporaryProject::new();
+        file.initialize();
+        let session = EditorDocumentSession::open(&file.0).expect("open project session");
+        let initial = session.snapshot().expect("read initial snapshot");
+        let scene_id = initial.document.active_scene_id;
+        let object = SceneObjectDocument::new("Cube", None);
+        let object_id = object.id;
+        session
+            .apply_command(SceneCommand::CreateObject { scene_id, object }, 0)
+            .expect("create object");
+
+        let gesture = session
+            .begin_transform_gesture("Cancelled move", 1)
+            .expect("begin gesture");
+        session
+            .update_transform_gesture(
+                gesture,
+                SceneCommand::SetTransform {
+                    scene_id,
+                    object_id,
+                    transform: TransformDocument {
+                        translation: [9.0, 4.0, -2.0],
+                        ..TransformDocument::default()
+                    },
+                },
+                1,
+            )
+            .expect("update transform");
+        assert!(
+            session
+                .cancel_transform_gesture(gesture)
+                .expect("cancel gesture")
+        );
+
+        let cancelled = session.snapshot().expect("read cancelled snapshot");
+        assert_eq!(cancelled.revision, 3);
+        assert_eq!(
+            cancelled.undo_depth, 1,
+            "cancel adds no transform history entry"
+        );
+        assert!(!cancelled.active_gesture);
+        assert_eq!(
+            cancelled.document.scenes[0].objects[0].local_transform,
+            TransformDocument::default()
+        );
+    }
 }
