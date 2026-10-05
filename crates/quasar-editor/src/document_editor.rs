@@ -1,6 +1,6 @@
 //! First editable ProjectDocument shell: hierarchy, inspector and a lightweight transform gizmo.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use bevy::{
     asset::AssetPlugin,
@@ -11,10 +11,18 @@ use bevy::{
 };
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use quasar_project::{
-    assets::{AssetCatalog, AssetId, AssetKind, AssetRecord, AssetStatus, ModelAssetComponent},
+    assets::{
+        AssetCatalog, AssetId, AssetKind, AssetRecord, AssetStatus, ModelAssetComponent,
+        ScriptComponent,
+    },
     commands::SceneCommand,
     document::{
         ObjectId, ProjectDocument, SceneDocument, SceneId, SceneObjectDocument, TransformDocument,
+    },
+    gameplay::{
+        AUDIO_SOURCE_COMPONENT_TYPE_ID, AudioCategory, AudioListenerComponent,
+        AudioSourceComponent, CameraComponent, CharacterControllerComponent, ColliderComponent,
+        ColliderShape, DoorComponent, RigidBodyComponent, RigidBodyKind, TypedComponent,
     },
 };
 
@@ -22,6 +30,8 @@ use crate::{
     document_session::{EditorDocumentSession, TransformGestureId},
     import::jobs::{AssetJobService, AssetJobSnapshot, AssetJobStatus},
     mcp_session::EditorMcpSession,
+    play::EditorPlayService,
+    script_editor,
 };
 use crate::{
     document_viewport::{self, DocumentViewport},
@@ -42,12 +52,15 @@ struct UiState {
     advanced: bool,
     console_open: bool,
     hierarchy_search: String,
+    script_edit: Option<(AssetId, String, u64)>,
+    script_dirty_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum WorkspaceTab {
     #[default]
     Scene,
+    Code,
     Assets,
 }
 
@@ -87,6 +100,7 @@ pub(crate) fn document_editor_app(
     session: EditorDocumentSession,
     mcp: EditorMcpSession,
     jobs: AssetJobService,
+    play: EditorPlayService,
 ) -> App {
     let mut app = App::new();
     let asset_root = session
@@ -115,6 +129,7 @@ pub(crate) fn document_editor_app(
     .insert_resource(session)
     .insert_resource(mcp)
     .insert_resource(jobs)
+    .insert_resource(play)
     .init_resource::<Selection>()
     .init_resource::<UiState>()
     .init_resource::<AssetBrowserState>()
@@ -188,6 +203,7 @@ fn sync_document_scene(
     rendered_revision.0 = Some(snapshot.revision);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_document_editor(
     mut contexts: EguiContexts,
     session: Res<EditorDocumentSession>,
@@ -195,6 +211,7 @@ fn draw_document_editor(
     mut ui_state: ResMut<UiState>,
     mut asset_browser: ResMut<AssetBrowserState>,
     jobs: Res<AssetJobService>,
+    play: Res<EditorPlayService>,
     mut viewport: ResMut<DocumentViewport>,
 ) -> Result {
     let Ok(snapshot) = session.snapshot() else {
@@ -256,37 +273,84 @@ fn draw_document_editor(
             .max_rect(ctx.viewport_rect()),
     );
 
-    egui::Panel::top("document_toolbar").frame(chrome::toolbar_frame()).show(&mut editor_ui, |ui| {
-        ui.horizontal(|ui| {
-            if chrome::tab(ui, "Scene", ui_state.workspace == WorkspaceTab::Scene).clicked() {
-                ui_state.workspace = WorkspaceTab::Scene;
-            }
-            ui.add_enabled(false, egui::Button::new("Code").min_size(egui::vec2(90.0, 34.0)))
-                .on_hover_text("The code workspace is planned; project scripts are not connected yet.");
-            if chrome::tab(ui, "Assets", ui_state.workspace == WorkspaceTab::Assets).clicked() {
-                ui_state.workspace = WorkspaceTab::Assets;
-            }
-            chrome::icon_button(ui, Icon::Plus, false, false, "Additional workspaces will be available in a later version.");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.selectable_label(ui_state.advanced, "Advanced").clicked() { ui_state.advanced = true; }
-                if ui.selectable_label(!ui_state.advanced, "Basic").clicked() { ui_state.advanced = false; }
-                ui.separator();
-                ui.add_enabled(false, egui::Button::new("Advisor")).on_hover_text("Advisor rules are planned.");
-                chrome::icon_button(ui, Icon::Play, false, false, "Document Play control is planned; standalone Player preview is available from the command line.");
-                ui.separator();
-                if chrome::icon_button(ui, Icon::Redo, false, snapshot.redo_depth > 0, "Redo").clicked()
-                    && let Err(error) = session.redo(snapshot.revision) { ui_state.status = error; }
-                if chrome::icon_button(ui, Icon::Undo, false, snapshot.undo_depth > 0, "Undo").clicked()
-                    && let Err(error) = session.undo(snapshot.revision) { ui_state.status = error; }
-                if chrome::icon_button(ui, Icon::Save, false, true, "Save project").clicked() {
-                    match session.save(snapshot.revision) {
-                        Ok(_) => ui_state.status = "Project saved".into(),
-                        Err(error) => ui_state.status = error,
-                    }
+    egui::Panel::top("document_toolbar")
+        .frame(chrome::toolbar_frame())
+        .show(&mut editor_ui, |ui| {
+            ui.horizontal(|ui| {
+                if chrome::tab(ui, "Scene", ui_state.workspace == WorkspaceTab::Scene).clicked() {
+                    ui_state.workspace = WorkspaceTab::Scene;
                 }
+                if chrome::tab(ui, "Code", ui_state.workspace == WorkspaceTab::Code).clicked() {
+                    ui_state.workspace = WorkspaceTab::Code;
+                }
+                if chrome::tab(ui, "Assets", ui_state.workspace == WorkspaceTab::Assets).clicked() {
+                    ui_state.workspace = WorkspaceTab::Assets;
+                }
+                chrome::icon_button(
+                    ui,
+                    Icon::Plus,
+                    false,
+                    false,
+                    "Additional workspaces will be available in a later version.",
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.selectable_label(ui_state.advanced, "Advanced").clicked() {
+                        ui_state.advanced = true;
+                    }
+                    if ui.selectable_label(!ui_state.advanced, "Basic").clicked() {
+                        ui_state.advanced = false;
+                    }
+                    ui.separator();
+                    ui.add_enabled(false, egui::Button::new("Advisor"))
+                        .on_hover_text("Advisor rules are planned.");
+                    let play_status = play.status(&session);
+                    if ui
+                        .button(if play_status.state == "Running" {
+                            "Stop"
+                        } else {
+                            "Play"
+                        })
+                        .on_hover_text(if play_status.state == "Running" {
+                            "Stop standalone Player"
+                        } else {
+                            "Launch current project in Player"
+                        })
+                        .clicked()
+                    {
+                        let result = if play_status.state == "Running" {
+                            play.stop(&session)
+                        } else {
+                            play.start(&session)
+                        };
+                        match result {
+                            Ok(status) => {
+                                ui_state.status = format!("Play {}", status.state.to_lowercase())
+                            }
+                            Err(error) => ui_state.status = error,
+                        }
+                    }
+                    ui.separator();
+                    if chrome::icon_button(ui, Icon::Redo, false, snapshot.redo_depth > 0, "Redo")
+                        .clicked()
+                        && let Err(error) = session.redo(snapshot.revision)
+                    {
+                        ui_state.status = error;
+                    }
+                    if chrome::icon_button(ui, Icon::Undo, false, snapshot.undo_depth > 0, "Undo")
+                        .clicked()
+                        && let Err(error) = session.undo(snapshot.revision)
+                    {
+                        ui_state.status = error;
+                    }
+                    if chrome::icon_button(ui, Icon::Save, false, true, "Save project").clicked() {
+                        match session.save(snapshot.revision) {
+                            Ok(_) => ui_state.status = "Project saved".into(),
+                            Err(error) => ui_state.status = error,
+                        }
+                    }
+                });
             });
         });
-    });
 
     egui::Panel::bottom("document_console")
         .frame(chrome::panel_frame())
@@ -430,7 +494,7 @@ fn draw_document_editor(
                         Err(error) => ui_state.status = error,
                     }
                 }
-            } else {
+            } else if ui_state.workspace == WorkspaceTab::Assets {
                 egui::ScrollArea::vertical()
                     .id_salt("asset-panel-body")
                     .show(ui, |ui| {
@@ -442,6 +506,25 @@ fn draw_document_editor(
                             &project_root,
                         );
                     });
+            } else {
+                ui.heading("Project scripts");
+                ui.separator();
+                let scripts = asset_browser
+                    .records
+                    .iter()
+                    .filter(|record| record.metadata.kind == AssetKind::Script)
+                    .map(|record| {
+                        (
+                            record.metadata.asset_id,
+                            record.metadata.source_path.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (_, source_path) in &scripts {
+                        ui.label(source_path);
+                    }
+                });
             }
         });
 
@@ -465,6 +548,7 @@ fn draw_document_editor(
                         scene_id,
                         snapshot.revision,
                         object,
+                        &objects,
                         &asset_browser.records,
                     );
                 });
@@ -478,6 +562,10 @@ fn draw_document_editor(
     egui::CentralPanel::default()
         .frame(chrome::panel_frame())
         .show(&mut editor_ui, |ui| {
+            if ui_state.workspace == WorkspaceTab::Code {
+                draw_code_workspace(ui, &session, &asset_browser.records, &mut ui_state);
+                return;
+            }
             ui.horizontal(|ui| {
                 chrome::tab(
                     ui,
@@ -558,6 +646,141 @@ fn draw_document_editor(
             }
         });
     Ok(())
+}
+
+fn draw_code_workspace(
+    ui: &mut egui::Ui,
+    session: &EditorDocumentSession,
+    assets: &[AssetRecord],
+    state: &mut UiState,
+) {
+    let scripts = assets
+        .iter()
+        .filter(|record| record.metadata.kind == AssetKind::Script)
+        .collect::<Vec<_>>();
+    ui.horizontal(|ui| {
+        ui.heading("Code");
+        ui.weak("Project Lua scripts");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let Some((asset_id, source, revision)) = state.script_edit.as_ref() else {
+                return;
+            };
+            let dirty = script_editor::read_script(session, *asset_id)
+                .is_ok_and(|current| current.revision != *revision || current.source != *source);
+            if ui
+                .add_enabled(dirty, egui::Button::new("Save script"))
+                .clicked()
+            {
+                let (id, text, expected) = (*asset_id, source.clone(), *revision);
+                match script_editor::write_script(session, id, expected, &text) {
+                    Ok(saved) => {
+                        state.script_edit = Some((saved.asset_id, saved.source, saved.revision));
+                        state.script_dirty_since = None;
+                        state.status = "Lua script saved".into();
+                    }
+                    Err(error) => state.status = error,
+                }
+            }
+        });
+    });
+    ui.separator();
+    if scripts.is_empty() {
+        ui.label("No project Lua scripts yet. Import a .lua file in Assets.");
+        return;
+    }
+    if state
+        .script_edit
+        .as_ref()
+        .is_none_or(|(id, _, _)| !scripts.iter().any(|r| r.metadata.asset_id == *id))
+        && let Some(script) = scripts.first()
+        && let Ok(script) = script_editor::read_script(session, script.metadata.asset_id)
+    {
+        state.script_edit = Some((script.asset_id, script.source, script.revision));
+    }
+    if let Some((asset_id, source, revision)) = &mut state.script_edit {
+        let current_name = scripts
+            .iter()
+            .find(|r| r.metadata.asset_id == *asset_id)
+            .map(|r| r.metadata.source_path.as_str())
+            .unwrap_or("Script");
+        let mut requested_script = None;
+        egui::ComboBox::from_id_salt("project-script-selector")
+            .selected_text(current_name)
+            .show_ui(ui, |ui| {
+                for record in &scripts {
+                    if ui
+                        .selectable_label(
+                            record.metadata.asset_id == *asset_id,
+                            &record.metadata.source_path,
+                        )
+                        .clicked()
+                    {
+                        requested_script = Some(record.metadata.asset_id);
+                    }
+                }
+            });
+        if let Some(next_id) = requested_script
+            && next_id != *asset_id
+        {
+            let can_switch = match script_editor::read_script(session, *asset_id) {
+                Ok(current) if current.revision != *revision || current.source != *source => {
+                    match script_editor::write_script(session, *asset_id, *revision, source) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            state.status = error;
+                            false
+                        }
+                    }
+                }
+                Ok(_) => true,
+                Err(error) => {
+                    state.status = error;
+                    false
+                }
+            };
+            if can_switch {
+                match script_editor::read_script(session, next_id) {
+                    Ok(script) => {
+                        *asset_id = script.asset_id;
+                        *source = script.source;
+                        *revision = script.revision;
+                        state.script_dirty_since = None;
+                    }
+                    Err(error) => state.status = error,
+                }
+            }
+        }
+        ui.add_space(6.0);
+        let response = ui.add(
+            egui::TextEdit::multiline(source)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(24),
+        );
+        if response.changed() {
+            state.script_dirty_since = Some(Instant::now());
+        }
+        if state
+            .script_dirty_since
+            .is_some_and(|since| since.elapsed() >= std::time::Duration::from_millis(700))
+        {
+            let (id, text, expected) = (*asset_id, source.clone(), *revision);
+            match script_editor::write_script(session, id, expected, &text) {
+                Ok(saved) => {
+                    *asset_id = saved.asset_id;
+                    *source = saved.source;
+                    *revision = saved.revision;
+                    state.script_dirty_since = None;
+                    state.status = "Lua script auto-saved".into();
+                }
+                Err(error) => {
+                    state.status = error;
+                    state.script_dirty_since = None;
+                }
+            }
+        }
+        ui.small("Lua syntax is validated on save. Stale revisions are rejected.");
+    }
 }
 
 fn draw_asset_browser(
@@ -779,6 +1002,7 @@ fn asset_kind_label(kind: AssetKind) -> &'static str {
         AssetKind::Model => "Model",
         AssetKind::Texture => "Texture",
         AssetKind::Audio => "Audio",
+        AssetKind::Script => "Script",
     }
 }
 
@@ -842,7 +1066,7 @@ mod asset_ui_tests {
     }
 }
 
-#[allow(clippy::collapsible_if)]
+#[allow(clippy::collapsible_if, clippy::too_many_arguments)]
 fn draw_inspector(
     ui: &mut egui::Ui,
     session: &EditorDocumentSession,
@@ -850,6 +1074,7 @@ fn draw_inspector(
     scene_id: SceneId,
     revision: u64,
     object: &SceneObjectDocument,
+    objects: &[SceneObjectDocument],
     assets: &[AssetRecord],
 ) {
     let object_id = object.id;
@@ -935,6 +1160,524 @@ fn draw_inspector(
         }
         return;
     }
+    let assigned_script = ScriptComponent::from_components(&object.components)
+        .ok()
+        .flatten()
+        .filter(|script| script.enabled)
+        .map(|script| script.asset_id);
+    let mut next_script = assigned_script;
+    ui.strong("Gameplay Script");
+    egui::ComboBox::from_id_salt(("script-asset", object_id))
+        .selected_text(
+            assigned_script
+                .and_then(|asset_id| {
+                    assets.iter().find(|asset| {
+                        asset.metadata.asset_id == asset_id
+                            && asset.metadata.kind == AssetKind::Script
+                    })
+                })
+                .and_then(|asset| std::path::Path::new(&asset.metadata.source_path).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("None"),
+        )
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next_script, None, "None");
+            for asset in assets.iter().filter(|asset| {
+                asset.metadata.kind == AssetKind::Script && asset.status == AssetStatus::Ready
+            }) {
+                ui.selectable_value(
+                    &mut next_script,
+                    Some(asset.metadata.asset_id),
+                    &asset.metadata.source_path,
+                );
+            }
+        });
+    if next_script != assigned_script {
+        match session.apply_command(
+            SceneCommand::AssignScriptAsset {
+                scene_id,
+                object_id,
+                asset_id: next_script,
+            },
+            revision,
+        ) {
+            Ok(_) => state.status = "Updated gameplay script".into(),
+            Err(error) => state.status = error,
+        }
+        return;
+    }
+
+    ui.separator();
+    ui.strong("Gameplay");
+    let camera = CameraComponent::from_components(&object.components)
+        .ok()
+        .flatten();
+    if let Some(mut camera) = camera {
+        let mut changed = ui.checkbox(&mut camera.enabled, "Camera enabled").changed();
+        if ui.small_button("Remove camera").clicked() {
+            remove_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                CameraComponent::TYPE_ID,
+                state,
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Vertical FOV");
+            changed |= ui
+                .add(egui::DragValue::new(&mut camera.vertical_fov_degrees).range(1.0..=179.0))
+                .changed();
+        });
+        if changed {
+            if let Err(error) = set_typed_component(session, scene_id, revision, object_id, camera)
+            {
+                state.status = error;
+            }
+            return;
+        }
+    } else if ui.button("+ Add Camera").clicked() {
+        if let Err(error) = set_typed_component(
+            session,
+            scene_id,
+            revision,
+            object_id,
+            CameraComponent::default(),
+        ) {
+            state.status = error;
+        }
+        return;
+    }
+
+    if let Some(mut listener) = AudioListenerComponent::from_components(&object.components)
+        .ok()
+        .flatten()
+    {
+        let changed = ui
+            .checkbox(&mut listener.enabled, "Audio listener enabled")
+            .changed();
+        if ui.small_button("Remove audio listener").clicked() {
+            remove_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                AudioListenerComponent::TYPE_ID,
+                state,
+            );
+            return;
+        }
+        if changed {
+            if let Err(error) =
+                set_typed_component(session, scene_id, revision, object_id, listener)
+            {
+                state.status = error;
+            }
+            return;
+        }
+    } else if ui.button("+ Add Audio Listener").clicked() {
+        if let Err(error) = set_typed_component(
+            session,
+            scene_id,
+            revision,
+            object_id,
+            AudioListenerComponent { enabled: true },
+        ) {
+            state.status = error;
+        }
+        return;
+    }
+
+    let collider = ColliderComponent::from_components(&object.components)
+        .ok()
+        .flatten();
+    if let Some(mut collider) = collider {
+        let mut changed = ui
+            .checkbox(&mut collider.enabled, "Collider enabled")
+            .changed();
+        if ui.small_button("Remove collider").clicked() {
+            remove_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                ColliderComponent::TYPE_ID,
+                state,
+            );
+            return;
+        }
+        match &mut collider.shape {
+            ColliderShape::Box { size } => {
+                ui.label("Box size");
+                changed |= vector3_controls(ui, size).changed;
+                ui.label("Center");
+                changed |= vector3_controls(ui, &mut collider.center).changed;
+            }
+            ColliderShape::Capsule { radius, height } => {
+                ui.horizontal(|ui| {
+                    ui.label("Radius");
+                    changed |= ui
+                        .add(egui::DragValue::new(radius).range(0.01..=1000.0))
+                        .changed();
+                    ui.label("Height");
+                    changed |= ui
+                        .add(egui::DragValue::new(height).range(0.02..=2000.0))
+                        .changed();
+                });
+                ui.label("Center");
+                changed |= vector3_controls(ui, &mut collider.center).changed;
+            }
+        }
+        if changed {
+            if let Err(error) =
+                set_typed_component(session, scene_id, revision, object_id, collider)
+            {
+                state.status = error;
+            }
+            return;
+        }
+    } else if ui.button("+ Add Box Collider").clicked() {
+        if let Err(error) = set_typed_component(
+            session,
+            scene_id,
+            revision,
+            object_id,
+            ColliderComponent {
+                enabled: true,
+                center: [0.0; 3],
+                shape: ColliderShape::Box { size: [1.0; 3] },
+            },
+        ) {
+            state.status = error;
+        }
+        return;
+    }
+
+    let body = RigidBodyComponent::from_components(&object.components)
+        .ok()
+        .flatten();
+    if let Some(mut body) = body {
+        let mut changed = ui
+            .checkbox(&mut body.enabled, "Rigid body enabled")
+            .changed();
+        if ui.small_button("Remove rigid body").clicked() {
+            remove_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                RigidBodyComponent::TYPE_ID,
+                state,
+            );
+            return;
+        }
+        egui::ComboBox::from_id_salt(("rigid-body-kind", object_id))
+            .selected_text(format!("{:?}", body.kind))
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(&mut body.kind, RigidBodyKind::Static, "Static")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut body.kind, RigidBodyKind::Kinematic, "Kinematic")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut body.kind, RigidBodyKind::Dynamic, "Dynamic")
+                    .changed();
+            });
+        ui.horizontal(|ui| {
+            ui.label("Mass");
+            changed |= ui
+                .add(egui::DragValue::new(&mut body.mass).range(0.001..=1_000_000.0))
+                .changed();
+            ui.label("Damping");
+            changed |= ui
+                .add(egui::DragValue::new(&mut body.linear_damping).range(0.0..=1000.0))
+                .changed();
+        });
+        if changed {
+            if let Err(error) = set_typed_component(session, scene_id, revision, object_id, body) {
+                state.status = error;
+            }
+            return;
+        }
+    } else if collider.is_some_and(|collider| collider.enabled)
+        && ui.button("+ Add Static Body").clicked()
+    {
+        if let Err(error) = set_typed_component(
+            session,
+            scene_id,
+            revision,
+            object_id,
+            RigidBodyComponent::default(),
+        ) {
+            state.status = error;
+        }
+        return;
+    }
+
+    let door = DoorComponent::from_components(&object.components)
+        .ok()
+        .flatten();
+    if let Some(mut door) = door {
+        let mut changed = ui.checkbox(&mut door.enabled, "Door enabled").changed();
+        if ui.small_button("Remove door").clicked() {
+            remove_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                DoorComponent::TYPE_ID,
+                state,
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Open angle");
+            changed |= ui
+                .add(egui::DragValue::new(&mut door.open_angle_degrees).range(1.0..=180.0))
+                .changed();
+            ui.label("Duration (s)");
+            changed |= ui
+                .add(egui::DragValue::new(&mut door.open_duration_seconds).range(0.05..=10.0))
+                .changed();
+        });
+        if changed {
+            if let Err(error) = set_typed_component(session, scene_id, revision, object_id, door) {
+                state.status = error;
+            }
+            return;
+        }
+    } else if ui.button("+ Add Door").clicked() {
+        if let Err(error) = set_typed_component(
+            session,
+            scene_id,
+            revision,
+            object_id,
+            DoorComponent::default(),
+        ) {
+            state.status = error;
+        }
+        return;
+    }
+
+    let controller = CharacterControllerComponent::from_components(&object.components)
+        .ok()
+        .flatten();
+    if let Some(mut controller) = controller {
+        let mut changed = ui
+            .checkbox(&mut controller.enabled, "Character controller enabled")
+            .changed();
+        if ui.small_button("Remove character controller").clicked() {
+            remove_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                CharacterControllerComponent::TYPE_ID,
+                state,
+            );
+            return;
+        }
+        for (label, value, range) in [
+            ("Walk speed", &mut controller.walk_speed, 0.0..=1000.0),
+            ("Jump speed", &mut controller.jump_speed, 0.0..=1000.0),
+            ("Gravity", &mut controller.gravity, 0.0..=1000.0),
+            ("Capsule radius", &mut controller.radius, 0.01..=1000.0),
+            ("Capsule height", &mut controller.height, 0.02..=2000.0),
+            ("Eye height", &mut controller.eye_height, 0.0..=2000.0),
+            (
+                "Max slope °",
+                &mut controller.max_slope_degrees,
+                0.0..=89.99,
+            ),
+            ("Step height", &mut controller.step_height, 0.0..=1000.0),
+            ("Ground snap", &mut controller.ground_snap, 0.0..=1000.0),
+            (
+                "Mouse sensitivity",
+                &mut controller.mouse_sensitivity,
+                0.0001..=1.0,
+            ),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                changed |= ui
+                    .add(egui::DragValue::new(value).speed(0.05).range(range))
+                    .changed();
+            });
+        }
+        let camera_options = objects
+            .iter()
+            .filter_map(|candidate| {
+                (candidate.parent_id == Some(object_id)
+                    && CameraComponent::from_components(&candidate.components)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|camera| camera.enabled))
+                .then_some((candidate.id, candidate.name.as_str()))
+            })
+            .collect::<Vec<_>>();
+        egui::ComboBox::from_id_salt(("controller-camera", object_id))
+            .selected_text(
+                camera_options
+                    .iter()
+                    .find(|(id, _)| *id == controller.camera_object)
+                    .map(|(_, name)| *name)
+                    .unwrap_or("Missing camera"),
+            )
+            .show_ui(ui, |ui| {
+                for (camera_id, camera_name) in &camera_options {
+                    changed |= ui
+                        .selectable_value(&mut controller.camera_object, *camera_id, *camera_name)
+                        .changed();
+                }
+            });
+        if changed {
+            if let Err(error) =
+                set_typed_component(session, scene_id, revision, object_id, controller)
+            {
+                state.status = error;
+            }
+            return;
+        }
+    } else if object.parent_id.is_none() {
+        let camera_options = objects
+            .iter()
+            .filter_map(|candidate| {
+                (candidate.parent_id == Some(object_id)
+                    && CameraComponent::from_components(&candidate.components)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|camera| camera.enabled))
+                .then_some((candidate.id, candidate.name.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if !camera_options.is_empty() {
+            let mut selected_camera = camera_options.first().map(|(id, _)| *id);
+            egui::ComboBox::from_id_salt(("new-controller-camera", object_id))
+                .selected_text(
+                    camera_options
+                        .first()
+                        .map(|(_, name)| *name)
+                        .unwrap_or("Select camera"),
+                )
+                .show_ui(ui, |ui| {
+                    for (camera_id, camera_name) in &camera_options {
+                        ui.selectable_value(&mut selected_camera, Some(*camera_id), *camera_name);
+                    }
+                });
+            if ui.button("+ Add Character Controller").clicked()
+                && let Some(camera_id) = selected_camera
+            {
+                if let Err(error) = set_typed_component(
+                    session,
+                    scene_id,
+                    revision,
+                    object_id,
+                    CharacterControllerComponent::new(camera_id),
+                ) {
+                    state.status = error;
+                }
+                return;
+            }
+        }
+    }
+
+    let audio_source = AudioSourceComponent::from_components(&object.components)
+        .ok()
+        .flatten();
+    let assigned_audio = audio_source.map(|source| source.asset_id);
+    let mut next_audio = assigned_audio;
+    egui::ComboBox::from_id_salt(("audio-asset", object_id))
+        .selected_text(
+            assigned_audio
+                .and_then(|id| {
+                    assets.iter().find(|asset| {
+                        asset.metadata.asset_id == id && asset.metadata.kind == AssetKind::Audio
+                    })
+                })
+                .and_then(|asset| std::path::Path::new(&asset.metadata.source_path).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("No Audio Source"),
+        )
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut next_audio, None, "None");
+            for asset in assets.iter().filter(|asset| {
+                asset.metadata.kind == AssetKind::Audio && asset.status == AssetStatus::Ready
+            }) {
+                ui.selectable_value(
+                    &mut next_audio,
+                    Some(asset.metadata.asset_id),
+                    &asset.metadata.source_path,
+                );
+            }
+        });
+    if next_audio != assigned_audio {
+        let result = if let Some(asset_id) = next_audio {
+            set_typed_component(
+                session,
+                scene_id,
+                revision,
+                object_id,
+                AudioSourceComponent {
+                    enabled: true,
+                    asset_id,
+                    volume: 1.0,
+                    looping: false,
+                    autoplay: false,
+                    spatial: true,
+                    category: AudioCategory::Sfx,
+                },
+            )
+        } else {
+            session
+                .apply_command(
+                    SceneCommand::RemoveComponent {
+                        scene_id,
+                        object_id,
+                        type_id: AUDIO_SOURCE_COMPONENT_TYPE_ID.into(),
+                    },
+                    revision,
+                )
+                .map(|_| ())
+        };
+        if let Err(error) = result {
+            state.status = error;
+        }
+        return;
+    }
+    if let Some(mut source) = audio_source {
+        let mut changed = ui
+            .checkbox(&mut source.enabled, "Audio source enabled")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Volume");
+            changed |= ui
+                .add(egui::Slider::new(&mut source.volume, 0.0..=1.0))
+                .changed();
+        });
+        changed |= ui.checkbox(&mut source.looping, "Loop").changed();
+        changed |= ui.checkbox(&mut source.autoplay, "Autoplay").changed();
+        changed |= ui.checkbox(&mut source.spatial, "Spatial").changed();
+        egui::ComboBox::from_id_salt(("audio-category", object_id))
+            .selected_text(format!("{:?}", source.category))
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(&mut source.category, AudioCategory::Music, "Music")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut source.category, AudioCategory::Sfx, "SFX")
+                    .changed();
+            });
+        if changed {
+            if let Err(error) = set_typed_component(session, scene_id, revision, object_id, source)
+            {
+                state.status = error;
+            }
+            return;
+        }
+    }
     let mut transform = object.local_transform;
     let mut interaction = TransformEditInteraction::default();
     ui.add_space(12.0);
@@ -987,6 +1730,46 @@ fn draw_inspector(
                 state.status = error;
             }
         }
+    }
+}
+
+fn set_typed_component<T: TypedComponent>(
+    session: &EditorDocumentSession,
+    scene_id: SceneId,
+    revision: u64,
+    object_id: ObjectId,
+    component: T,
+) -> Result<(), String> {
+    session
+        .apply_command(
+            SceneCommand::SetComponent {
+                scene_id,
+                object_id,
+                component: component.into_document(),
+            },
+            revision,
+        )
+        .map(|_| ())
+}
+
+fn remove_component(
+    session: &EditorDocumentSession,
+    scene_id: SceneId,
+    revision: u64,
+    object_id: ObjectId,
+    type_id: &str,
+    state: &mut UiState,
+) {
+    match session.apply_command(
+        SceneCommand::RemoveComponent {
+            scene_id,
+            object_id,
+            type_id: type_id.to_owned(),
+        },
+        revision,
+    ) {
+        Ok(_) => state.status = format!("Removed {type_id}"),
+        Err(error) => state.status = error,
     }
 }
 

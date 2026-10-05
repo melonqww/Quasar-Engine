@@ -12,6 +12,8 @@ use uuid::Uuid;
 pub const ASSET_METADATA_VERSION: u32 = 1;
 pub const MODEL_COMPONENT_TYPE_ID: &str = "quasar.model";
 pub const MODEL_COMPONENT_SCHEMA_VERSION: u32 = 1;
+pub const SCRIPT_COMPONENT_TYPE_ID: &str = "quasar.script";
+pub const SCRIPT_COMPONENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -35,6 +37,7 @@ pub enum AssetKind {
     Model,
     Texture,
     Audio,
+    Script,
 }
 
 impl AssetKind {
@@ -43,7 +46,56 @@ impl AssetKind {
             Self::Model => "Models",
             Self::Texture => "Textures",
             Self::Audio => "Audio",
+            Self::Script => "Scripts",
         }
+    }
+}
+
+/// Reference from an authored scene object to a validated project Lua script asset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptComponent {
+    pub asset_id: AssetId,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl ScriptComponent {
+    pub fn into_component(self) -> crate::document::ComponentDocument {
+        crate::document::ComponentDocument {
+            type_id: SCRIPT_COMPONENT_TYPE_ID.to_owned(),
+            schema_version: SCRIPT_COMPONENT_SCHEMA_VERSION,
+            data: serde_json::to_value(self).expect("script component is serializable"),
+        }
+    }
+
+    pub fn from_components(
+        components: &[crate::document::ComponentDocument],
+    ) -> Result<Option<Self>, String> {
+        let mut found = None;
+        for component in components
+            .iter()
+            .filter(|c| c.type_id == SCRIPT_COMPONENT_TYPE_ID)
+        {
+            if component.schema_version != SCRIPT_COMPONENT_SCHEMA_VERSION {
+                return Err(format!(
+                    "unsupported script component version {}; supported version is {}",
+                    component.schema_version, SCRIPT_COMPONENT_SCHEMA_VERSION
+                ));
+            }
+            if found.is_some() {
+                return Err("object contains more than one script component".to_owned());
+            }
+            found = Some(
+                serde_json::from_value(component.data.clone())
+                    .map_err(|e| format!("invalid script component: {e}"))?,
+            );
+        }
+        Ok(found)
     }
 }
 
@@ -256,6 +308,39 @@ pub fn sidecar_path(source_path: &Path) -> PathBuf {
     let mut name = source_path.file_name().unwrap_or_default().to_os_string();
     name.push(".meta.json");
     source_path.with_file_name(name)
+}
+
+/// Checks the RIFF/WAVE container and required format/data chunks without decoding audio.
+pub fn validate_wav(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("WAV file has an invalid RIFF/WAVE header".to_owned());
+    }
+    let declared_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8;
+    if declared_length > bytes.len() || declared_length < 12 {
+        return Err("WAV declared length exceeds the file size".to_owned());
+    }
+    let mut offset = 12usize;
+    let mut has_format = false;
+    let mut has_data = false;
+    while offset + 8 <= declared_length {
+        let chunk_length =
+            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start
+            .checked_add(chunk_length)
+            .filter(|end| *end <= declared_length)
+            .ok_or_else(|| "WAV chunk extends beyond the declared file length".to_owned())?;
+        match &bytes[offset..offset + 4] {
+            b"fmt " if chunk_length >= 16 => has_format = true,
+            b"data" if chunk_length > 0 => has_data = true,
+            _ => {}
+        }
+        offset = chunk_end + (chunk_length & 1);
+    }
+    if offset != declared_length || !has_format || !has_data {
+        return Err("WAV must contain complete format and audio data chunks".to_owned());
+    }
+    Ok(())
 }
 
 pub fn validate_project_relative_path(label: &str, value: &str) -> Result<(), String> {

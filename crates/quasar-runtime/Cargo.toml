@@ -8,6 +8,7 @@ bevy.workspace = true
 bevy_rapier3d.workspace = true
 mlua.workspace = true
 quasar-project.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

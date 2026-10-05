@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod assets;
 pub mod commands;
 pub mod document;
+pub mod gameplay;
 pub mod persistence;
 pub mod validation;
 

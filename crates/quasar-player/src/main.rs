@@ -1,34 +1,47 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
 };
 
 use bevy::{
     asset::AssetPlugin,
-    audio::Volume,
+    audio::{GlobalVolume, SpatialListener, Volume},
     gltf::GltfAssetLabel,
     input::InputSystems,
+    input::mouse::AccumulatedMouseMotion,
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
-    window::WindowPlugin,
+    window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowPlugin},
     world_serialization::WorldAssetRoot,
 };
 use bevy_rapier3d::prelude::{
-    CharacterAutostep, CharacterLength, Collider, KinematicCharacterController, NoUserData,
-    RapierPhysicsPlugin, TimestepMode,
+    AdditionalMassProperties, CharacterAutostep, CharacterLength, Collider, Damping,
+    KinematicCharacterController, NoUserData, PhysicsSet, QueryFilter, RapierPhysicsPlugin,
+    ReadRapierContext, RigidBody, TimestepMode,
 };
 use quasar_project::document::{ObjectId, ProjectDocument, SceneDocument};
 use quasar_project::{
     ProjectSnapshot, SceneSnapshot, SnapshotObject, SnapshotObjectKind,
-    assets::{AssetCatalog, AssetKind, AssetStatus, ModelAssetComponent},
+    assets::{AssetCatalog, AssetKind, AssetStatus, ModelAssetComponent, ScriptComponent},
+    gameplay::{
+        AudioListenerComponent, AudioSourceComponent, CameraComponent,
+        CharacterControllerComponent, ColliderComponent, DoorComponent, RigidBodyComponent,
+        TypedComponent,
+    },
 };
 use quasar_runtime::{
     animation::{
         AnimationProbeData, AnimationProbePlugin, AnimationSessionAudio, AnimationWorkspaceState,
         SnapshotObjectId, stage0_character_model_transform,
     },
+    gameplay::ProjectGameplayCommand,
     gameplay::{GameplayCommand, run_door_interaction},
     physics::{CharacterController, CharacterControllerInput},
+    project_scene::{
+        character_controller, collider_from_document, controller_collider, rigid_body,
+        transform_from_document,
+    },
 };
 
 const PROBE_TITLE: &str = "Quasar Player · Stage 0";
@@ -53,6 +66,8 @@ struct ResolvedSnapshot {
 #[derive(Clone, Debug, Resource)]
 struct ResolvedDocument {
     project_path: PathBuf,
+    asset_root: PathBuf,
+    asset_catalog: AssetCatalog,
     document: ProjectDocument,
 }
 
@@ -60,6 +75,37 @@ struct ResolvedDocument {
 struct DocumentObjectId {
     _id: ObjectId,
 }
+
+#[derive(Component)]
+struct DocumentAudioVoice;
+
+#[derive(Component)]
+struct DoorMotion {
+    closed_rotation: Quat,
+    open_angle_radians: f32,
+    duration_seconds: f32,
+    elapsed_seconds: Option<f32>,
+}
+
+impl DoorMotion {
+    fn begin_open(&mut self) {
+        if self.elapsed_seconds.is_none() {
+            self.elapsed_seconds = Some(0.0);
+        }
+    }
+}
+
+#[derive(Component)]
+struct PlayerCameraSettings {
+    sensitivity: f32,
+    pitch: f32,
+}
+
+#[derive(Component)]
+struct ControllerMouseSensitivity(f32);
+
+#[derive(Resource, Default)]
+struct PendingDocumentJump(bool);
 
 #[derive(Component)]
 struct PlayerDoor;
@@ -109,7 +155,13 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(document_path) = parse_project_document_argument(&args)? {
-        let document = resolve_project_document(&document_path)?;
+        let asset_root = parse_asset_root_argument(&args)?.unwrap_or_else(|| {
+            document_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
+        let document = resolve_project_document_with_asset_root(&document_path, &asset_root)?;
         let screenshot = parse_screenshot_argument(&args)?;
         if args.iter().any(|argument| argument == "--validate-only") {
             let scene = active_document_scene(&document.document)?;
@@ -166,7 +218,29 @@ fn parse_project_document_argument(args: &[String]) -> Result<Option<PathBuf>, S
     Ok(document)
 }
 
-fn resolve_project_document(path: &Path) -> Result<ResolvedDocument, String> {
+fn parse_asset_root_argument(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut root = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--asset-root" {
+            if root.is_some() {
+                return Err("--asset-root may be supplied only once".to_owned());
+            }
+            index += 1;
+            root = Some(PathBuf::from(
+                args.get(index)
+                    .ok_or_else(|| "--asset-root requires a path".to_owned())?,
+            ));
+        }
+        index += 1;
+    }
+    Ok(root)
+}
+
+fn resolve_project_document_with_asset_root(
+    path: &Path,
+    asset_root: &Path,
+) -> Result<ResolvedDocument, String> {
     let project_path = fs::canonicalize(path).map_err(|error| {
         format!(
             "cannot resolve project document {}: {error}",
@@ -174,42 +248,165 @@ fn resolve_project_document(path: &Path) -> Result<ResolvedDocument, String> {
         )
     })?;
     let document = ProjectDocument::load(&project_path)?;
-    validate_document_model_assets(&project_path, &document)?;
+    let asset_root = fs::canonicalize(asset_root).map_err(|error| {
+        format!(
+            "cannot resolve asset root {}: {error}",
+            asset_root.display()
+        )
+    })?;
+    validate_document_model_assets(&asset_root, &document)?;
+    validate_document_scene_audio(active_document_scene(&document)?, &document)?;
+    let asset_catalog = AssetCatalog::scan(&asset_root);
     Ok(ResolvedDocument {
         project_path,
+        asset_root,
+        asset_catalog,
         document,
     })
 }
 
 fn validate_document_model_assets(
-    project_path: &Path,
+    project_root: &Path,
     document: &ProjectDocument,
 ) -> Result<(), String> {
-    let project_root = project_path
-        .parent()
-        .ok_or_else(|| "project document has no project root".to_owned())?;
     let catalog = AssetCatalog::scan(project_root);
     for object in document.scenes.iter().flat_map(|scene| &scene.objects) {
-        let Some(reference) = ModelAssetComponent::from_components(&object.components)? else {
-            continue;
-        };
-        let asset = catalog
-            .assets
-            .iter()
-            .find(|asset| asset.metadata.asset_id == reference.asset_id)
-            .ok_or_else(|| {
-                format!(
-                    "object '{}' references missing model asset '{}'",
+        if let Some(reference) = ModelAssetComponent::from_components(&object.components)? {
+            let asset =
+                find_ready_asset(project_root, &catalog, reference.asset_id, AssetKind::Model)
+                    .map_err(|message| format!("object '{}': {message}", object.name))?;
+            if !project_root.join(&asset.metadata.source_path).is_file() {
+                return Err(format!(
+                    "object '{}' references model asset '{}' whose source file is missing",
                     object.name, reference.asset_id.0
+                ));
+            }
+        }
+        if let Some(reference) = ScriptComponent::from_components(&object.components)?
+            && reference.enabled
+        {
+            let asset = find_ready_asset(
+                project_root,
+                &catalog,
+                reference.asset_id,
+                AssetKind::Script,
+            )
+            .map_err(|message| format!("object '{}': {message}", object.name))?;
+            let source_path = project_root.join(&asset.metadata.source_path);
+            let source = fs::read_to_string(&source_path).map_err(|error| {
+                format!(
+                    "object '{}' Lua script '{}' cannot be read: {error}",
+                    object.name, asset.metadata.source_path
                 )
             })?;
-        if asset.metadata.kind != AssetKind::Model || asset.status != AssetStatus::Ready {
-            return Err(format!(
-                "object '{}' references model asset '{}' in status {:?}",
-                object.name, reference.asset_id.0, asset.status
-            ));
+            quasar_runtime::gameplay::validate_project_script(&asset.metadata.source_path, &source)
+                .map_err(|error| format!("object '{}' Lua script error: {error}", object.name))?;
+        }
+        if let Some(reference) = AudioSourceComponent::from_components(&object.components)?
+            && reference.enabled
+        {
+            let asset =
+                find_ready_asset(project_root, &catalog, reference.asset_id, AssetKind::Audio)
+                    .map_err(|message| format!("object '{}': {message}", object.name))?;
+            if !project_root.join(&asset.metadata.source_path).is_file() {
+                return Err(format!(
+                    "object '{}' references audio asset '{}' whose source file is missing",
+                    object.name, reference.asset_id.0
+                ));
+            }
+            quasar_project::assets::validate_wav(
+                &fs::read(project_root.join(&asset.metadata.source_path)).map_err(|error| {
+                    format!("object '{}' WAV asset cannot be read: {error}", object.name)
+                })?,
+            )
+            .map_err(|error| format!("object '{}' WAV asset is invalid: {error}", object.name))?;
         }
     }
+    Ok(())
+}
+
+fn find_ready_asset<'a>(
+    project_root: &Path,
+    catalog: &'a AssetCatalog,
+    asset_id: quasar_project::assets::AssetId,
+    expected_kind: AssetKind,
+) -> Result<&'a quasar_project::assets::AssetRecord, String> {
+    let asset = catalog
+        .assets
+        .iter()
+        .find(|asset| asset.metadata.asset_id == asset_id)
+        .ok_or_else(|| {
+            format!(
+                "references missing {:?} asset '{}'",
+                expected_kind, asset_id.0
+            )
+        })?;
+    if asset.metadata.kind != expected_kind || asset.status != AssetStatus::Ready {
+        return Err(format!(
+            "references {:?} asset '{}' in kind/status {:?}/{:?}",
+            expected_kind, asset_id.0, asset.metadata.kind, asset.status
+        ));
+    }
+    let root = fs::canonicalize(project_root)
+        .map_err(|error| format!("cannot resolve asset root: {error}"))?;
+    let source = fs::canonicalize(&asset.source_file).map_err(|error| {
+        format!(
+            "asset '{}' source cannot be resolved: {error}",
+            asset.metadata.source_path
+        )
+    })?;
+    if !source.starts_with(root) {
+        return Err(format!(
+            "asset '{}' resolves outside the project root",
+            asset.metadata.source_path
+        ));
+    }
+    Ok(asset)
+}
+
+fn validate_document_scene_audio(
+    scene: &SceneDocument,
+    document: &ProjectDocument,
+) -> Result<(), String> {
+    let listeners = scene
+        .objects
+        .iter()
+        .filter_map(|object| {
+            AudioListenerComponent::from_components(&object.components)
+                .ok()
+                .flatten()
+        })
+        .filter(|listener| listener.enabled)
+        .count();
+    let mut spatial_sources = 0usize;
+    let mut autoplay_sources = 0usize;
+    for object in &scene.objects {
+        if let Some(source) = AudioSourceComponent::from_components(&object.components)?
+            && source.enabled
+        {
+            spatial_sources += usize::from(source.spatial);
+            autoplay_sources += usize::from(source.autoplay);
+        }
+    }
+    if listeners > 1 {
+        return Err(format!(
+            "active scene '{}' has {listeners} enabled audio listeners; exactly one is supported",
+            scene.name
+        ));
+    }
+    if spatial_sources > 0 && listeners != 1 {
+        return Err(format!(
+            "active scene '{}' has spatial audio sources but no enabled Audio Listener",
+            scene.name
+        ));
+    }
+    if autoplay_sources > 32 {
+        return Err(format!(
+            "active scene '{}' has {autoplay_sources} autoplay sources; the session budget is 32",
+            scene.name
+        ));
+    }
+    document.audio.validate()?;
     Ok(())
 }
 
@@ -227,12 +424,7 @@ fn launch_document_preview(
 ) -> Result<(), String> {
     let scene = active_document_scene(&document.document)?;
     let mut app = App::new();
-    let asset_root = document
-        .project_path
-        .parent()
-        .ok_or_else(|| "project document has no project root".to_owned())?
-        .to_string_lossy()
-        .into_owned();
+    let asset_root = document.asset_root.to_string_lossy().into_owned();
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
@@ -251,7 +443,30 @@ fn launch_document_preview(
             }),
     )
     .insert_resource(document.clone())
-    .add_systems(Startup, setup_document_preview);
+    .insert_resource(GlobalVolume::new(Volume::Linear(
+        document.document.audio.master,
+    )))
+    .insert_resource(TimestepMode::Fixed {
+        dt: 1.0 / 60.0,
+        substeps: 1,
+    })
+    .init_resource::<PendingDocumentJump>()
+    .add_plugins(RapierPhysicsPlugin::<NoUserData>::default().in_fixed_schedule())
+    .add_plugins(quasar_runtime::physics::CharacterControllerPlugin)
+    .add_systems(Startup, setup_document_preview)
+    .add_systems(
+        PreUpdate,
+        collect_document_controller_input.after(InputSystems),
+    )
+    .add_systems(
+        FixedUpdate,
+        animate_document_doors.before(PhysicsSet::SyncBackend),
+    )
+    .add_systems(
+        FixedUpdate,
+        consume_document_jump.after(PhysicsSet::SyncBackend),
+    )
+    .add_systems(Update, document_interact.after(TransformSystems::Propagate));
     if let Some(path) = screenshot {
         app.insert_resource(ScreenshotRequest(path))
             .add_systems(Update, capture_screenshot_after_render_warmup);
@@ -273,10 +488,6 @@ fn setup_document_preview(
     asset_server: Res<AssetServer>,
 ) {
     commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(5.0, 4.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    commands.spawn((
         DirectionalLight {
             illuminance: 10_000.0,
             shadow_maps_enabled: true,
@@ -287,7 +498,31 @@ fn setup_document_preview(
     let Ok(scene) = active_document_scene(&document.document) else {
         return;
     };
-    let mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let active_controller = scene.objects.iter().find_map(|object| {
+        CharacterControllerComponent::from_components(&object.components)
+            .ok()
+            .flatten()
+            .filter(|controller| controller.enabled)
+            .map(|controller| (object.id, controller))
+    });
+    let active_camera_object = active_controller
+        .map(|(_, controller)| controller.camera_object)
+        .or_else(|| {
+            scene.objects.iter().find_map(|object| {
+                CameraComponent::from_components(&object.components)
+                    .ok()
+                    .flatten()
+                    .filter(|camera| camera.enabled)
+                    .map(|_| object.id)
+            })
+        });
+    if active_camera_object.is_none() {
+        commands.spawn((
+            Camera3d::default(),
+            Transform::from_xyz(5.0, 4.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+    }
+    let default_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.36, 0.58, 0.76),
         perceptual_roughness: 0.78,
@@ -298,27 +533,23 @@ fn setup_document_preview(
         .iter()
         .map(|object| (object.id, commands.spawn_empty().id()))
         .collect::<std::collections::HashMap<_, _>>();
-    let asset_catalog = AssetCatalog::scan(
-        document
-            .project_path
-            .parent()
-            .unwrap_or_else(|| Path::new(".")),
-    );
+    let asset_catalog = &document.asset_catalog;
     for object in &scene.objects {
         let Some(&entity) = entities.get(&object.id) else {
             continue;
         };
-        let transform = Transform {
-            translation: Vec3::from_array(object.local_transform.translation),
-            rotation: Quat::from_xyzw(
-                object.local_transform.rotation_xyzw[0],
-                object.local_transform.rotation_xyzw[1],
-                object.local_transform.rotation_xyzw[2],
-                object.local_transform.rotation_xyzw[3],
-            ),
-            scale: Vec3::from_array(object.local_transform.scale),
-        };
-        let mut entity_commands = commands.entity(entity);
+        let mut transform = transform_from_document(&object.local_transform);
+        let object_mesh = ColliderComponent::from_components(&object.components)
+            .ok()
+            .flatten()
+            .filter(|collider| collider.enabled)
+            .and_then(|collider| match collider.shape {
+                quasar_project::gameplay::ColliderShape::Box { size } => {
+                    Some(meshes.add(Cuboid::from_size(Vec3::from_array(size))))
+                }
+                quasar_project::gameplay::ColliderShape::Capsule { .. } => None,
+            })
+            .unwrap_or_else(|| default_mesh.clone());
         let model_path = ModelAssetComponent::from_components(&object.components)
             .ok()
             .flatten()
@@ -331,27 +562,417 @@ fn setup_document_preview(
             })
             .map(|asset| asset.metadata.source_path.clone());
         if let Some(model_path) = model_path {
-            entity_commands.insert((
+            commands.entity(entity).insert((
                 WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(model_path))),
                 transform,
                 Name::new(object.name.clone()),
                 DocumentObjectId { _id: object.id },
             ));
         } else {
-            entity_commands.insert((
-                Mesh3d(mesh.clone()),
+            commands.entity(entity).insert((
+                Mesh3d(object_mesh),
                 MeshMaterial3d(material.clone()),
                 transform,
                 Name::new(object.name.clone()),
                 DocumentObjectId { _id: object.id },
             ));
         }
+        if let Ok(Some(controller)) =
+            CharacterControllerComponent::from_components(&object.components)
+            && controller.enabled
+        {
+            commands.entity(entity).insert((
+                RigidBody::KinematicPositionBased,
+                controller_collider(&controller),
+                character_controller(&controller),
+                ControllerMouseSensitivity(controller.mouse_sensitivity),
+                CharacterController::with_tuning(
+                    controller.walk_speed,
+                    controller.jump_speed,
+                    controller.gravity,
+                ),
+                CharacterControllerInput::default(),
+            ));
+        } else if let Ok(Some(collider)) = ColliderComponent::from_components(&object.components)
+            && collider.enabled
+        {
+            commands.spawn((
+                collider_from_document(&collider),
+                Transform::from_translation(Vec3::from_array(collider.center)),
+                DocumentObjectId { _id: object.id },
+                ChildOf(entity),
+            ));
+            if let Ok(Some(body)) = RigidBodyComponent::from_components(&object.components)
+                && body.enabled
+            {
+                commands.entity(entity).insert((
+                    rigid_body(body.kind),
+                    Damping {
+                        linear_damping: body.linear_damping,
+                        ..default()
+                    },
+                ));
+                if body.kind == quasar_project::gameplay::RigidBodyKind::Dynamic {
+                    commands
+                        .entity(entity)
+                        .insert(AdditionalMassProperties::Mass(body.mass));
+                }
+            } else {
+                commands.entity(entity).insert(RigidBody::Fixed);
+            }
+        }
+        if let Ok(Some(door)) = DoorComponent::from_components(&object.components)
+            && door.enabled
+        {
+            commands.entity(entity).insert(DoorMotion {
+                closed_rotation: transform.rotation,
+                open_angle_radians: door.open_angle_degrees.to_radians(),
+                duration_seconds: door.open_duration_seconds,
+                elapsed_seconds: None,
+            });
+        }
+        if let Ok(Some(camera)) = CameraComponent::from_components(&object.components)
+            && camera.enabled
+            && active_camera_object == Some(object.id)
+        {
+            let is_player_camera = active_controller.is_some();
+            if is_player_camera && let Some((_, controller)) = active_controller {
+                transform.translation.y = controller.eye_height;
+                commands.entity(entity).insert(PlayerCameraSettings {
+                    sensitivity: controller.mouse_sensitivity,
+                    pitch: 0.0,
+                });
+            }
+            commands.entity(entity).insert((
+                Camera3d::default(),
+                Projection::Perspective(PerspectiveProjection {
+                    fov: camera.vertical_fov_degrees.to_radians(),
+                    ..default()
+                }),
+            ));
+        }
+        if let Ok(Some(listener)) = AudioListenerComponent::from_components(&object.components)
+            && listener.enabled
+        {
+            commands.entity(entity).insert(SpatialListener::new(0.2));
+        }
+        if let Ok(Some(source)) = AudioSourceComponent::from_components(&object.components)
+            && source.enabled
+            && source.autoplay
+            && let Some(asset) = asset_catalog.assets.iter().find(|asset| {
+                asset.metadata.asset_id == source.asset_id
+                    && asset.metadata.kind == AssetKind::Audio
+                    && asset.status == AssetStatus::Ready
+            })
+        {
+            let category_gain = match source.category {
+                quasar_project::gameplay::AudioCategory::Music => document.document.audio.music,
+                quasar_project::gameplay::AudioCategory::Sfx => document.document.audio.sfx,
+            };
+            let settings = if source.looping {
+                PlaybackSettings::LOOP
+            } else {
+                PlaybackSettings::DESPAWN
+            }
+            .with_volume(Volume::Linear(source.volume * category_gain))
+            .with_spatial(source.spatial);
+            commands.spawn((
+                AudioPlayer::new(asset_server.load(asset.metadata.source_path.clone())),
+                settings,
+                Transform::default(),
+                ChildOf(entity),
+                DocumentAudioVoice,
+            ));
+        }
         if let Some(parent_id) = object.parent_id
             && let Some(&parent) = entities.get(&parent_id)
         {
-            entity_commands.insert(ChildOf(parent));
+            commands.entity(entity).insert(ChildOf(parent));
         }
     }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn collect_document_controller_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut pending_jump: ResMut<PendingDocumentJump>,
+    mouse: Res<AccumulatedMouseMotion>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    mut cursor_options: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut controllers: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut CharacterControllerInput,
+            &ControllerMouseSensitivity,
+        ),
+        (With<CharacterController>, Without<PlayerCameraSettings>),
+    >,
+    mut cameras: Query<
+        (&mut Transform, &mut PlayerCameraSettings, &ChildOf),
+        (With<PlayerCameraSettings>, Without<CharacterController>),
+    >,
+) {
+    let mut focused = false;
+    let mut cursor_locked = false;
+    if let (Ok(window), Ok(mut cursor_options)) = (window.single(), cursor_options.single_mut()) {
+        focused = window.focused;
+        cursor_locked = cursor_options.grab_mode == CursorGrabMode::Locked;
+        if keyboard.just_pressed(KeyCode::Escape) && cursor_locked {
+            cursor_options.grab_mode = CursorGrabMode::None;
+            cursor_options.visible = true;
+            cursor_locked = false;
+        } else if mouse_buttons.just_pressed(MouseButton::Left) && !cursor_locked {
+            cursor_options.grab_mode = CursorGrabMode::Locked;
+            cursor_options.visible = false;
+            cursor_locked = true;
+        }
+    }
+    if focused && keyboard.just_pressed(KeyCode::Space) {
+        pending_jump.0 = true;
+    }
+    if !focused {
+        pending_jump.0 = false;
+    }
+    let mut local = Vec2::ZERO;
+    if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
+        local.x -= 1.0;
+    }
+    if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
+        local.x += 1.0;
+    }
+    if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
+        local.y += 1.0;
+    }
+    if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
+        local.y -= 1.0;
+    }
+    for (entity, mut transform, mut input, sensitivity) in &mut controllers {
+        if focused && cursor_locked {
+            transform.rotate_y(-mouse.delta.x * sensitivity.0);
+        }
+        let right = transform.rotation * Vec3::X;
+        let forward = transform.rotation * -Vec3::Z;
+        let world = right * local.x + forward * local.y;
+        input.movement = if focused {
+            Vec2::new(world.x, -world.z)
+        } else {
+            Vec2::ZERO
+        };
+        input.jump_pressed = focused && cursor_locked && pending_jump.0;
+        for (mut camera_transform, mut settings, parent) in &mut cameras {
+            if parent.parent() == entity && focused && cursor_locked {
+                settings.pitch = (settings.pitch - mouse.delta.y * settings.sensitivity)
+                    .clamp(-1.48353, 1.48353);
+                camera_transform.rotation = Quat::from_rotation_x(settings.pitch);
+            }
+        }
+    }
+}
+
+fn consume_document_jump(mut pending_jump: ResMut<PendingDocumentJump>) {
+    pending_jump.0 = false;
+}
+
+fn animate_document_doors(
+    time: Res<Time<Fixed>>,
+    mut doors: Query<(&mut Transform, &mut DoorMotion)>,
+) {
+    for (mut transform, mut door) in &mut doors {
+        let Some(previous_elapsed) = door.elapsed_seconds else {
+            continue;
+        };
+        let duration = door.duration_seconds;
+        let elapsed = (previous_elapsed + time.delta_secs()).min(duration);
+        let progress = (elapsed / duration).clamp(0.0, 1.0);
+        transform.rotation = document_door_rotation(&door, progress);
+        door.elapsed_seconds = (progress < 1.0).then_some(elapsed);
+    }
+}
+
+fn document_door_rotation(door: &DoorMotion, progress: f32) -> Quat {
+    let progress = progress.clamp(0.0, 1.0);
+    let eased = progress * progress * (3.0 - 2.0 * progress);
+    door.closed_rotation * Quat::from_rotation_y(door.open_angle_radians * eased)
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn document_interact(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    cursor_options: Query<&CursorOptions, With<PrimaryWindow>>,
+    document: Res<ResolvedDocument>,
+    asset_server: Res<AssetServer>,
+    rapier_context: ReadRapierContext,
+    controllers: Query<Entity, With<CharacterController>>,
+    cameras: Query<(&GlobalTransform, &ChildOf), With<PlayerCameraSettings>>,
+    object_ids: Query<&DocumentObjectId>,
+    mut objects: Query<
+        (Entity, &DocumentObjectId, &mut Transform, &GlobalTransform),
+        Without<PlayerCameraSettings>,
+    >,
+    mut door_motions: Query<(&DocumentObjectId, &mut DoorMotion)>,
+    mut commands: Commands,
+    voices: Query<(), With<DocumentAudioVoice>>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyE)
+        || !cursor_options
+            .single()
+            .is_ok_and(|options| options.grab_mode == CursorGrabMode::Locked)
+    {
+        return;
+    }
+    let Ok(player) = controllers.single() else {
+        return;
+    };
+    let Some((camera_transform, _)) = cameras.iter().find(|(_, parent)| parent.parent() == player)
+    else {
+        return;
+    };
+    let origin = camera_transform.translation();
+    let direction = (camera_transform.rotation() * Vec3::NEG_Z).normalize_or_zero();
+    if direction == Vec3::ZERO {
+        return;
+    }
+    let Ok(rapier) = rapier_context.single() else {
+        return;
+    };
+    let Some((hit, _distance)) = rapier.cast_ray(
+        origin,
+        direction,
+        2.0,
+        true,
+        QueryFilter::default().exclude_collider(player),
+    ) else {
+        return;
+    };
+    let Ok(hit_object_id) = object_ids.get(hit) else {
+        return;
+    };
+    let object_id = hit_object_id._id;
+    let Some(scene) = active_document_scene(&document.document).ok() else {
+        return;
+    };
+    let Some(object) = scene.objects.iter().find(|object| object.id == object_id) else {
+        return;
+    };
+    let Ok(Some(script)) = ScriptComponent::from_components(&object.components) else {
+        return;
+    };
+    if !script.enabled {
+        return;
+    }
+    let Some(script_asset) = document.asset_catalog.assets.iter().find(|asset| {
+        asset.metadata.asset_id == script.asset_id
+            && asset.metadata.kind == AssetKind::Script
+            && asset.status == AssetStatus::Ready
+    }) else {
+        return;
+    };
+    let script_path = document.asset_root.join(&script_asset.metadata.source_path);
+    let source = match fs::read_to_string(&script_path) {
+        Ok(source) => source,
+        Err(error) => {
+            warn!(path = %script_path.display(), %error, "cannot read project interaction script");
+            return;
+        }
+    };
+    let valid_objects = scene
+        .objects
+        .iter()
+        .map(|object| object.id)
+        .collect::<HashSet<_>>();
+    let valid_doors = enabled_kinematic_doors(scene);
+    let valid_audio = document
+        .asset_catalog
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            (asset.metadata.kind == AssetKind::Audio && asset.status == AssetStatus::Ready)
+                .then_some(asset.metadata.asset_id)
+        })
+        .collect::<HashSet<_>>();
+    let gameplay = match quasar_runtime::gameplay::run_project_interaction(
+        &script_asset.metadata.source_path,
+        &source,
+        object_id,
+        &valid_objects,
+        &valid_doors,
+        &valid_audio,
+    ) {
+        Ok(commands) => commands,
+        Err(error) => {
+            warn!(%error, "project interaction callback failed; commands discarded");
+            return;
+        }
+    };
+    for action in gameplay {
+        match action {
+            ProjectGameplayCommand::RotateObjectY { object_id, radians } => {
+                if let Some((_, _, mut transform, _)) =
+                    objects.iter_mut().find(|(_, id, _, _)| id._id == object_id)
+                {
+                    transform.rotate_y(radians);
+                }
+            }
+            ProjectGameplayCommand::OpenDoor { object_id } => {
+                if let Some((_, mut motion)) =
+                    door_motions.iter_mut().find(|(id, _)| id._id == object_id)
+                {
+                    motion.begin_open();
+                }
+            }
+            ProjectGameplayCommand::PlayAudio { asset_id } => {
+                if voices.iter().count() >= 32 {
+                    warn!("project audio voice budget is full; one-shot was skipped");
+                    continue;
+                }
+                let Some(asset) = document.asset_catalog.assets.iter().find(|asset| {
+                    asset.metadata.asset_id == asset_id
+                        && asset.metadata.kind == AssetKind::Audio
+                        && asset.status == AssetStatus::Ready
+                }) else {
+                    continue;
+                };
+                let position = objects
+                    .iter()
+                    .find(|(_, id, _, _)| id._id == object_id)
+                    .map(|(_, _, _, global)| global.translation())
+                    .unwrap_or(origin);
+                commands.spawn((
+                    AudioPlayer::new(asset_server.load(asset.metadata.source_path.clone())),
+                    PlaybackSettings::DESPAWN
+                        .with_volume(Volume::Linear(document.document.audio.sfx))
+                        .with_spatial(true),
+                    Transform::from_translation(position),
+                    DocumentAudioVoice,
+                ));
+            }
+        }
+    }
+}
+
+fn enabled_kinematic_doors(scene: &SceneDocument) -> HashSet<ObjectId> {
+    scene
+        .objects
+        .iter()
+        .filter_map(|object| {
+            let door = DoorComponent::from_components(&object.components)
+                .ok()
+                .flatten()?;
+            let body = RigidBodyComponent::from_components(&object.components)
+                .ok()
+                .flatten()?;
+            let collider = ColliderComponent::from_components(&object.components)
+                .ok()
+                .flatten()?;
+            (door.enabled
+                && body.enabled
+                && body.kind == quasar_project::gameplay::RigidBodyKind::Kinematic
+                && collider.enabled)
+                .then_some(object.id)
+        })
+        .collect()
 }
 
 fn parse_snapshot_argument(args: &[String]) -> Result<PathBuf, String> {
@@ -949,10 +1570,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        PlayerDoor, PlayerSessionAudio, PlayerSessionState, benchmark_route_direction,
+        DoorMotion, PlayerDoor, PlayerSessionAudio, PlayerSessionState, active_document_scene,
+        benchmark_route_direction, document_door_rotation, enabled_kinematic_doors,
         handle_session_audio_input, interact_with_door, parse_screenshot_argument,
-        parse_snapshot_argument, percentile, read_player_input, resolve_snapshot,
-        validate_document_model_assets,
+        parse_snapshot_argument, percentile, read_player_input,
+        resolve_project_document_with_asset_root, resolve_snapshot, validate_document_model_assets,
     };
     use bevy::{
         asset::{AssetApp, AssetPlugin},
@@ -965,6 +1587,10 @@ mod tests {
     use quasar_project::{
         assets::{ASSET_METADATA_VERSION, AssetId, AssetKind, AssetMetadata, ModelAssetComponent},
         document::{ProjectDocument, SceneDocument, SceneObjectDocument},
+        gameplay::{
+            AudioSourceComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
+            DoorComponent, RigidBodyComponent, RigidBodyKind, TypedComponent,
+        },
     };
 
     fn fixture_snapshot() -> PathBuf {
@@ -975,6 +1601,10 @@ mod tests {
     fn animation_fixture_snapshot() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/stage0-animation/quasar.snapshot.json")
+    }
+
+    fn gameplay_fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/stage4-gameplay")
     }
 
     struct TestProject(PathBuf);
@@ -1083,6 +1713,38 @@ mod tests {
                 .join("Quasar/audio/door-latch.wav")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn persistent_gameplay_fixture_resolves_door_audio_and_full_physics_contract() {
+        let root = gameplay_fixture_root();
+        let document =
+            resolve_project_document_with_asset_root(&root.join("quasar.project.json"), &root)
+                .expect("Stage 4 gameplay fixture and its referenced assets resolve");
+        let scene = active_document_scene(&document.document).unwrap();
+        assert_eq!(scene.objects.len(), 8);
+        assert_eq!(enabled_kinematic_doors(scene).len(), 1);
+        assert!(scene.objects.iter().any(|object| {
+            RigidBodyComponent::from_components(&object.components)
+                .ok()
+                .flatten()
+                .is_some_and(|body| {
+                    body.enabled && body.kind == quasar_project::gameplay::RigidBodyKind::Dynamic
+                })
+        }));
+        assert!(scene.objects.iter().any(|object| {
+            CharacterControllerComponent::from_components(&object.components)
+                .ok()
+                .flatten()
+                .is_some_and(|controller| controller.enabled)
+        }));
+        assert!(scene.objects.iter().any(|object| {
+            AudioSourceComponent::from_components(&object.components)
+                .ok()
+                .flatten()
+                .is_some_and(|source| source.enabled && source.autoplay && source.looping)
+        }));
+        assert_eq!(document.asset_catalog.assets.len(), 3);
     }
 
     #[test]
@@ -1211,10 +1873,10 @@ mod tests {
         std::fs::create_dir_all(project.0.join("Assets/Models"))
             .expect("asset folder can be created");
 
-        let error = validate_document_model_assets(&document_path, &document)
+        let error = validate_document_model_assets(&project.0, &document)
             .expect_err("missing model reference prevents Player launch");
         assert!(
-            error.contains("missing model asset"),
+            error.contains("missing Model asset"),
             "unexpected error: {error}"
         );
 
@@ -1223,11 +1885,11 @@ mod tests {
             .join("../../tests/fixtures/stage0-player/assets/Quasar/viewport-prop.glb");
         std::fs::copy(&fixture, project.0.join(source)).expect("valid GLB fixture copies");
         write_model_metadata(&project.0, asset_id, source);
-        validate_document_model_assets(&document_path, &document)
+        validate_document_model_assets(&project.0, &document)
             .expect("ready model reference is accepted");
 
         std::fs::remove_file(project.0.join(source)).expect("model source can be removed");
-        let error = validate_document_model_assets(&document_path, &document)
+        let error = validate_document_model_assets(&project.0, &document)
             .expect_err("metadata with a missing model source prevents Player launch");
         assert!(error.contains("Missing"), "unexpected error: {error}");
         std::fs::copy(&fixture, project.0.join(source)).expect("model source can be restored");
@@ -1235,7 +1897,7 @@ mod tests {
         let second_source = "Assets/Models/model-copy.glb";
         std::fs::copy(&fixture, project.0.join(second_source)).expect("duplicate GLB copies");
         write_model_metadata(&project.0, asset_id, second_source);
-        let error = validate_document_model_assets(&document_path, &document)
+        let error = validate_document_model_assets(&project.0, &document)
             .expect_err("duplicate AssetId prevents Player launch");
         assert!(error.contains("Conflict"), "unexpected error: {error}");
     }
@@ -1251,6 +1913,70 @@ mod tests {
         assert!((input.movement.length() - 1.0).abs() < 1e-6);
         assert!(input.movement.x > 0.0 && input.movement.y > 0.0);
         assert!(input.jump_pressed);
+    }
+
+    #[test]
+    fn authored_door_eases_from_closed_pose_to_configured_open_angle() {
+        let door = DoorMotion {
+            closed_rotation: Quat::from_rotation_y(0.2),
+            open_angle_radians: 1.2,
+            duration_seconds: 0.75,
+            elapsed_seconds: None,
+        };
+        let closed = document_door_rotation(&door, 0.0);
+        let midpoint = document_door_rotation(&door, 0.5);
+        let open = document_door_rotation(&door, 1.0);
+        assert!(closed.abs_diff_eq(door.closed_rotation, 1e-6));
+        assert!(midpoint.abs_diff_eq(Quat::from_rotation_y(0.8), 1e-5));
+        assert!(open.abs_diff_eq(Quat::from_rotation_y(1.4), 1e-5));
+        assert!(document_door_rotation(&door, 2.0).abs_diff_eq(open, 1e-6));
+    }
+
+    #[test]
+    fn only_enabled_doors_with_kinematic_bodies_and_colliders_are_interactable() {
+        let mut scene = SceneDocument::new("Main");
+        let mut door = SceneObjectDocument::new("Door", None);
+        door.components
+            .push(DoorComponent::default().into_document());
+        door.components.push(
+            RigidBodyComponent {
+                kind: RigidBodyKind::Kinematic,
+                ..RigidBodyComponent::default()
+            }
+            .into_document(),
+        );
+        door.components.push(
+            ColliderComponent {
+                enabled: true,
+                center: [0.0; 3],
+                shape: ColliderShape::Box { size: [1.0; 3] },
+            }
+            .into_document(),
+        );
+        let expected_id = door.id;
+        scene.objects.push(door);
+
+        let mut static_door = SceneObjectDocument::new("Static Door", None);
+        static_door
+            .components
+            .push(DoorComponent::default().into_document());
+        static_door
+            .components
+            .push(RigidBodyComponent::default().into_document());
+        static_door.components.push(
+            ColliderComponent {
+                enabled: true,
+                center: [0.0; 3],
+                shape: ColliderShape::Box { size: [1.0; 3] },
+            }
+            .into_document(),
+        );
+        scene.objects.push(static_door);
+
+        assert_eq!(
+            enabled_kinematic_doors(&scene),
+            std::collections::HashSet::from([expected_id])
+        );
     }
 
     #[test]

@@ -8,7 +8,9 @@ mod editor_style;
 mod gameplay_probe;
 mod import;
 mod mcp_session;
+mod play;
 mod project_probe;
+mod script_editor;
 mod viewport_probe;
 
 use bevy::prelude::App;
@@ -23,9 +25,10 @@ pub fn compatibility_probe_app() -> App {
         let session = document_session::EditorDocumentSession::open(&path)
             .unwrap_or_else(|error| panic!("cannot open Editor project document: {error}"));
         let jobs = import::jobs::AssetJobService::default();
-        let mcp = mcp_session::start_mcp_session(session.clone(), jobs.clone())
+        let play = play::EditorPlayService::default();
+        let mcp = mcp_session::start_mcp_session(session.clone(), jobs.clone(), play.clone())
             .unwrap_or_else(|error| panic!("cannot start Editor MCP session: {error}"));
-        return document_editor::document_editor_app(session, mcp, jobs);
+        return document_editor::document_editor_app(session, mcp, jobs, play);
     }
     let project = project_probe::open_stage0_project()
         .unwrap_or_else(|error| panic!("cannot open Stage 0 animation project: {error}"));

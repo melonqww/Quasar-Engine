@@ -15,9 +15,10 @@ use std::{
 
 use bevy::prelude::Resource;
 use quasar_project::{
-    assets::{AssetCatalog, AssetKind, AssetStatus},
+    assets::{AssetCatalog, AssetId, AssetKind, AssetStatus, ModelAssetComponent, ScriptComponent},
     commands::SceneCommand,
-    document::SceneId,
+    document::{ComponentDocument, ObjectId, SceneId},
+    gameplay::AudioSourceComponent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,6 +26,8 @@ use uuid::Uuid;
 
 use crate::document_session::EditorDocumentSession;
 use crate::import::jobs::AssetJobService;
+use crate::play::EditorPlayService;
+use crate::script_editor;
 
 const SESSION_FILE: &str = "editor-session.json";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -82,6 +85,7 @@ pub(crate) fn project_document_argument(args: &[String]) -> Result<Option<PathBu
 pub(crate) fn start_mcp_session(
     session: EditorDocumentSession,
     jobs: AssetJobService,
+    play: EditorPlayService,
 ) -> Result<EditorMcpSession, String> {
     let directory = std::env::temp_dir().join("QuasarEngine");
     fs::create_dir_all(&directory).map_err(|error| {
@@ -112,15 +116,20 @@ pub(crate) fn start_mcp_session(
     let worker_shutdown = Arc::clone(&shutdown);
     let document = session.clone();
     let asset_jobs = jobs.clone();
+    let editor_play = play.clone();
     let worker_token = descriptor.token.clone();
     let worker = thread::Builder::new()
         .name("quasar-editor-mcp-session".to_owned())
         .spawn(move || {
             while !worker_shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        serve_internal_request(stream, &worker_token, &document, &asset_jobs)
-                    }
+                    Ok((stream, _)) => serve_internal_request(
+                        stream,
+                        &worker_token,
+                        &document,
+                        &asset_jobs,
+                        &editor_play,
+                    ),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(20));
                     }
@@ -209,6 +218,7 @@ fn serve_internal_request(
     expected_token: &str,
     session: &EditorDocumentSession,
     jobs: &AssetJobService,
+    play: &EditorPlayService,
 ) {
     // TcpStream instances accepted from a nonblocking listener may themselves
     // stay nonblocking on Windows. The MCP client completes connect() before
@@ -230,7 +240,7 @@ fn serve_internal_request(
                 Ok(_) => serde_json::from_slice::<Value>(&request_bytes)
                     .map_err(|error| format!("invalid local MCP request: {error}"))
                     .and_then(|request| {
-                        handle_internal_request(request, expected_token, session, jobs)
+                        handle_internal_request(request, expected_token, session, jobs, play)
                     }),
                 Err(error) => Err(format!("cannot read local MCP request: {error}")),
             }
@@ -249,6 +259,7 @@ fn handle_internal_request(
     expected_token: &str,
     session: &EditorDocumentSession,
     jobs: &AssetJobService,
+    play: &EditorPlayService,
 ) -> Result<Value, String> {
     if request.get("token").and_then(Value::as_str) != Some(expected_token) {
         return Err("local MCP session authentication failed".to_owned());
@@ -261,6 +272,31 @@ fn handle_internal_request(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    match method {
+        "play_start" => return Ok(json!(play.start(session)?)),
+        "play_stop" => return Ok(json!(play.stop(session)?)),
+        "play_status" => return Ok(json!(play.status(session))),
+        "read_project_script" => {
+            return Ok(json!(script_editor::read_script(
+                session,
+                required_asset_id(&arguments, "asset_id")?,
+            )?));
+        }
+        "write_project_script" => {
+            let source = arguments
+                .get("source")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "write_project_script requires source".to_owned())?;
+            let written = script_editor::write_script(
+                session,
+                required_asset_id(&arguments, "asset_id")?,
+                required_revision(&arguments)?,
+                source,
+            )?;
+            return Ok(json!(written));
+        }
+        _ => {}
+    }
     if matches!(method, "preview_scene_command" | "apply_scene_command") {
         let expected_revision = required_revision(&arguments)?;
         let command: SceneCommand = serde_json::from_value(
@@ -402,6 +438,25 @@ fn handle_internal_request(
                 "changed": receipt.changed,
             }));
         }
+        "assign_script_asset" => {
+            let command = SceneCommand::AssignScriptAsset {
+                scene_id: SceneId(required_uuid(&arguments, "scene_id")?),
+                object_id: ObjectId(required_uuid(&arguments, "object_id")?),
+                asset_id: match arguments.get("asset_id") {
+                    Some(Value::Null) | None => None,
+                    Some(Value::String(_)) => Some(AssetId(required_uuid(&arguments, "asset_id")?)),
+                    _ => return Err("asset_id must be a UUID or null".to_owned()),
+                },
+            };
+            validate_command_asset_reference(&command, session)?;
+            let receipt = session.apply_command(command, required_revision(&arguments)?)?;
+            return Ok(json!({
+                "revision": receipt.revision,
+                "label": receipt.label,
+                "affected_objects": receipt.affected_objects,
+                "changed": receipt.changed,
+            }));
+        }
         _ => {}
     }
     let active_scene = document
@@ -473,11 +528,17 @@ fn validate_command_asset_reference(
     command: &SceneCommand,
     session: &EditorDocumentSession,
 ) -> Result<(), String> {
-    let SceneCommand::AssignModelAsset {
-        asset_id: Some(asset_id),
-        ..
-    } = command
-    else {
+    let reference = match command {
+        SceneCommand::AssignModelAsset {
+            asset_id: Some(id), ..
+        } => Some((*id, AssetKind::Model)),
+        SceneCommand::AssignScriptAsset {
+            asset_id: Some(id), ..
+        } => Some((*id, AssetKind::Script)),
+        SceneCommand::SetComponent { component, .. } => component_asset_reference(component)?,
+        _ => None,
+    };
+    let Some((asset_id, kind)) = reference else {
         return Ok(());
     };
     let snapshot = session.snapshot()?;
@@ -489,12 +550,52 @@ fn validate_command_asset_reference(
     let asset = catalog
         .assets
         .iter()
-        .find(|asset| asset.metadata.asset_id == *asset_id)
-        .ok_or_else(|| format!("model asset '{}' is not in the project catalog", asset_id.0))?;
-    if asset.metadata.kind != AssetKind::Model || asset.status != AssetStatus::Ready {
-        return Err(format!("asset '{}' is not a ready model asset", asset_id.0));
+        .find(|asset| asset.metadata.asset_id == asset_id)
+        .ok_or_else(|| {
+            format!(
+                "{} asset '{}' is not in the project catalog",
+                asset_kind_label(kind),
+                asset_id.0
+            )
+        })?;
+    if asset.metadata.kind != kind || asset.status != AssetStatus::Ready {
+        return Err(format!(
+            "asset '{}' is not a ready {} asset",
+            asset_id.0,
+            asset_kind_label(kind)
+        ));
     }
     Ok(())
+}
+
+fn component_asset_reference(
+    component: &ComponentDocument,
+) -> Result<Option<(AssetId, AssetKind)>, String> {
+    if component.type_id == quasar_project::assets::MODEL_COMPONENT_TYPE_ID {
+        let reference: ModelAssetComponent = serde_json::from_value(component.data.clone())
+            .map_err(|error| format!("invalid model asset component: {error}"))?;
+        return Ok(Some((reference.asset_id, AssetKind::Model)));
+    }
+    if component.type_id == quasar_project::assets::SCRIPT_COMPONENT_TYPE_ID {
+        let reference: ScriptComponent = serde_json::from_value(component.data.clone())
+            .map_err(|error| format!("invalid script component: {error}"))?;
+        return Ok(Some((reference.asset_id, AssetKind::Script)));
+    }
+    if component.type_id == quasar_project::gameplay::AUDIO_SOURCE_COMPONENT_TYPE_ID {
+        let reference: AudioSourceComponent = serde_json::from_value(component.data.clone())
+            .map_err(|error| format!("invalid audio source component: {error}"))?;
+        return Ok(Some((reference.asset_id, AssetKind::Audio)));
+    }
+    Ok(None)
+}
+
+fn asset_kind_label(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Model => "model",
+        AssetKind::Texture => "texture",
+        AssetKind::Audio => "audio",
+        AssetKind::Script => "script",
+    }
 }
 
 fn required_revision(arguments: &Value) -> Result<u64, String> {
@@ -509,7 +610,12 @@ mod asset_tests {
     use super::*;
     use quasar_project::{
         assets::ModelAssetComponent,
+        commands::SceneCommand,
         document::{ProjectDocument, SceneDocument, SceneObjectDocument},
+        gameplay::{
+            ColliderComponent, ColliderShape, DoorComponent, RigidBodyComponent, RigidBodyKind,
+            TypedComponent,
+        },
     };
     use std::{thread, time::Instant};
 
@@ -546,7 +652,13 @@ mod asset_tests {
         let jobs = jobs.clone();
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("test bridge accepts request");
-            serve_internal_request(stream, &token, &session, &jobs);
+            serve_internal_request(
+                stream,
+                &token,
+                &session,
+                &jobs,
+                &EditorPlayService::default(),
+            );
         });
         let mut client = TcpStream::connect(address).expect("test client connects to bridge");
         let mut bytes = serde_json::to_vec(&request).expect("test request serializes");
@@ -582,8 +694,8 @@ mod asset_tests {
         let session = EditorDocumentSession::open(&project.document_path())
             .expect("Editor document session opens");
         let jobs = AssetJobService::default();
-        let editor_endpoint =
-            start_mcp_session(session, jobs).expect("Editor starts its nonblocking MCP listener");
+        let editor_endpoint = start_mcp_session(session, jobs, EditorPlayService::default())
+            .expect("Editor starts its nonblocking MCP listener");
         let descriptor: SessionDescriptor = serde_json::from_slice(
             &fs::read(&editor_endpoint.manifest_path).expect("session manifest is published"),
         )
@@ -811,6 +923,128 @@ mod asset_tests {
             )
             .unwrap_err()
             .contains("authentication failed")
+        );
+    }
+
+    #[test]
+    fn mcp_authors_kinematic_door_with_undo_redo_save_and_reopen() {
+        let project = TestProject::new();
+        let mut scene = SceneDocument::new("Main");
+        let scene_id = scene.id;
+        let door = SceneObjectDocument::new("Door", None);
+        let door_id = door.id;
+        scene.objects.push(door);
+        ProjectDocument::new("Door MCP test", scene)
+            .save(&project.document_path())
+            .expect("test project document saves");
+        let session = EditorDocumentSession::open(&project.document_path())
+            .expect("Editor document session opens");
+        let jobs = AssetJobService::default();
+        let token = "door-test-token";
+
+        let collider = ColliderComponent {
+            enabled: true,
+            center: [0.0; 3],
+            shape: ColliderShape::Box {
+                size: [1.0, 2.0, 0.12],
+            },
+        };
+        let body = RigidBodyComponent {
+            kind: RigidBodyKind::Kinematic,
+            ..RigidBodyComponent::default()
+        };
+        let mut revision = 0;
+        for component in [
+            collider.into_document(),
+            body.into_document(),
+            DoorComponent::default().into_document(),
+        ] {
+            let command = SceneCommand::SetComponent {
+                scene_id,
+                object_id: door_id,
+                component,
+            };
+            let result = local_request(
+                json!({
+                    "token": token,
+                    "method": "apply_scene_command",
+                    "arguments": {"expected_revision": revision, "command": command}
+                }),
+                token,
+                &session,
+                &jobs,
+            )
+            .expect("MCP applies the door component command");
+            revision = result["revision"].as_u64().expect("revision is returned");
+        }
+        assert_eq!(revision, 3);
+
+        let stale = local_request(
+            json!({
+                "token": token,
+                "method": "apply_scene_command",
+                "arguments": {
+                    "expected_revision": 2,
+                    "command": SceneCommand::SetComponent {
+                        scene_id,
+                        object_id: door_id,
+                        component: DoorComponent::default().into_document()
+                    }
+                }
+            }),
+            token,
+            &session,
+            &jobs,
+        )
+        .expect_err("stale MCP edit is rejected");
+        assert!(stale.contains("revision_conflict"));
+
+        local_request(
+            json!({"token": token, "method": "undo", "arguments": {"expected_revision": 3}}),
+            token,
+            &session,
+            &jobs,
+        )
+        .expect("MCP undoes the door component");
+        assert!(
+            DoorComponent::from_components(
+                &session.snapshot().unwrap().document.scenes[0].objects[0].components
+            )
+            .unwrap()
+            .is_none()
+        );
+        local_request(
+            json!({"token": token, "method": "redo", "arguments": {"expected_revision": 4}}),
+            token,
+            &session,
+            &jobs,
+        )
+        .expect("MCP redoes the door component");
+        local_request(
+            json!({"token": token, "method": "save_project", "arguments": {"expected_revision": 5}}),
+            token,
+            &session,
+            &jobs,
+        )
+        .expect("MCP saves the authored door");
+        let reopened = ProjectDocument::load(&project.document_path())
+            .expect("project with authored door reopens");
+        let components = &reopened.scenes[0].objects[0].components;
+        assert_eq!(
+            DoorComponent::from_components(components).unwrap(),
+            Some(DoorComponent::default())
+        );
+        assert_eq!(
+            RigidBodyComponent::from_components(components)
+                .unwrap()
+                .unwrap()
+                .kind,
+            RigidBodyKind::Kinematic
+        );
+        assert!(
+            ColliderComponent::from_components(components)
+                .unwrap()
+                .is_some()
         );
     }
 }

@@ -2,8 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::assets::ModelAssetComponent;
+use crate::assets::{ModelAssetComponent, ScriptComponent};
 use crate::document::{PROJECT_DOCUMENT_VERSION, ProjectDocument, SCENE_DOCUMENT_VERSION};
+use crate::gameplay::{
+    AudioListenerComponent, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
+    ColliderComponent, DoorComponent, RigidBodyComponent, TypedComponent,
+};
 
 pub fn validate_project(project: &ProjectDocument) -> Result<(), String> {
     if project.format_version != PROJECT_DOCUMENT_VERSION {
@@ -15,6 +19,7 @@ pub fn validate_project(project: &ProjectDocument) -> Result<(), String> {
     if project.name.trim().is_empty() {
         return Err("project name must not be empty".to_owned());
     }
+    project.audio.validate()?;
     if project.scenes.is_empty() {
         return Err("project must contain at least one scene".to_owned());
     }
@@ -65,8 +70,28 @@ pub fn validate_project(project: &ProjectDocument) -> Result<(), String> {
                     object.id.0
                 )
             })?;
+            ScriptComponent::from_components(&object.components).map_err(|error| {
+                format!(
+                    "object '{}' has an invalid script reference: {error}",
+                    object.id.0
+                )
+            })?;
+            for result in [
+                CameraComponent::from_components(&object.components).map(|_| ()),
+                CharacterControllerComponent::from_components(&object.components).map(|_| ()),
+                ColliderComponent::from_components(&object.components).map(|_| ()),
+                RigidBodyComponent::from_components(&object.components).map(|_| ()),
+                AudioSourceComponent::from_components(&object.components).map(|_| ()),
+                AudioListenerComponent::from_components(&object.components).map(|_| ()),
+                DoorComponent::from_components(&object.components).map(|_| ()),
+            ] {
+                result.map_err(|error| {
+                    format!("object '{}' has an invalid component: {error}", object.id.0)
+                })?;
+            }
             scene_objects.insert(object.id, object.parent_id);
         }
+        validate_scene_gameplay(scene)?;
         for object in &scene.objects {
             if let Some(parent_id) = object.parent_id {
                 if !scene_objects.contains_key(&parent_id) {
@@ -94,6 +119,117 @@ pub fn validate_project(project: &ProjectDocument) -> Result<(), String> {
             "active scene '{}' does not exist in the project",
             project.active_scene_id.0
         ));
+    }
+    Ok(())
+}
+
+fn validate_scene_gameplay(scene: &crate::document::SceneDocument) -> Result<(), String> {
+    use crate::gameplay::{ColliderShape, RigidBodyKind};
+    let active_controller_count = scene
+        .objects
+        .iter()
+        .filter_map(|object| {
+            CharacterControllerComponent::from_components(&object.components)
+                .ok()
+                .flatten()
+        })
+        .filter(|component| component.enabled)
+        .count();
+    if active_controller_count > 1 {
+        return Err(format!(
+            "scene '{}' contains multiple enabled character controllers; only one is supported",
+            scene.name
+        ));
+    }
+    let by_id = scene
+        .objects
+        .iter()
+        .map(|object| (object.id, object))
+        .collect::<HashMap<_, _>>();
+    for object in &scene.objects {
+        let controller = CharacterControllerComponent::from_components(&object.components)?;
+        let collider = ColliderComponent::from_components(&object.components)?;
+        let body = RigidBodyComponent::from_components(&object.components)?;
+        if let Some(controller) = controller.filter(|component| component.enabled) {
+            if object.parent_id.is_some() {
+                return Err(format!(
+                    "character controller '{}' must be on a root object",
+                    object.name
+                ));
+            }
+            if collider.is_some() || body.is_some() {
+                return Err(format!(
+                    "character controller '{}' owns its capsule; remove its separate collider and rigid body",
+                    object.name
+                ));
+            }
+            let camera = by_id.get(&controller.camera_object).ok_or_else(|| {
+                format!(
+                    "controller '{}' references a camera object that does not exist",
+                    object.name
+                )
+            })?;
+            let camera_component = CameraComponent::from_components(&camera.components)?
+                .ok_or_else(|| {
+                    format!(
+                        "controller '{}' reference is missing its camera component",
+                        object.name
+                    )
+                })?;
+            if !camera_component.enabled || camera.parent_id != Some(object.id) {
+                return Err(format!(
+                    "controller '{}' must reference an enabled child camera",
+                    object.name
+                ));
+            }
+            validate_physics_scale_chain(object, &by_id)?;
+        }
+        if let Some(collider) = collider.filter(|component| component.enabled) {
+            match collider.shape {
+                ColliderShape::Box { .. } | ColliderShape::Capsule { .. } => {}
+            }
+            validate_physics_scale_chain(object, &by_id)?;
+        }
+        if let Some(body) = body.filter(|component| component.enabled) {
+            if collider.is_none_or(|component| !component.enabled) {
+                return Err(format!(
+                    "rigid body '{}' requires an enabled collider on the same object",
+                    object.name
+                ));
+            }
+            if body.kind != RigidBodyKind::Static && object.parent_id.is_some() {
+                return Err(format!(
+                    "kinematic and dynamic rigid body '{}' must be on a root object",
+                    object.name
+                ));
+            }
+            validate_physics_scale_chain(object, &by_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_physics_scale_chain<'a>(
+    object: &'a crate::document::SceneObjectDocument,
+    objects: &HashMap<crate::document::ObjectId, &'a crate::document::SceneObjectDocument>,
+) -> Result<(), String> {
+    let mut current = Some(object);
+    while let Some(node) = current {
+        let scale = node.local_transform.scale;
+        let uniform = scale[0] > 0.0
+            && scale[1] > 0.0
+            && scale[2] > 0.0
+            && (scale[0] - scale[1]).abs() <= 1e-4
+            && (scale[1] - scale[2]).abs() <= 1e-4;
+        if !uniform {
+            return Err(format!(
+                "physics object '{}' and its parents require a positive uniform scale",
+                object.name
+            ));
+        }
+        current = node
+            .parent_id
+            .and_then(|parent| objects.get(&parent).copied());
     }
     Ok(())
 }

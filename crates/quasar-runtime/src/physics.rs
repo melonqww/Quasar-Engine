@@ -36,6 +36,17 @@ impl Default for CharacterController {
     }
 }
 
+impl CharacterController {
+    pub fn with_tuning(walk_speed: f32, jump_speed: f32, gravity: f32) -> Self {
+        Self {
+            walk_speed,
+            jump_speed,
+            gravity,
+            ..Self::default()
+        }
+    }
+}
+
 /// Input supplied by the host (editor, Player, or tests); positive Y means forward.
 #[derive(Component, Debug, Default, Clone, Copy, PartialEq)]
 pub struct CharacterControllerInput {

@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "project_id": "02994800-0000-4000-8000-000000000001",
+  "name": "Stage 4 Gameplay Acceptance",
+  "active_scene_id": "02994800-0000-4000-8000-000000000002",
+  "scenes": [{
+    "schema_version": 1,
+    "id": "02994800-0000-4000-8000-000000000002",
+    "name": "Gameplay Acceptance",
+    "objects": [
+      {"id":"02994800-0000-4000-8000-000000000003","name":"Floor","parent_id":null,"local_transform":{"translation":[0.0,-0.1,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.collider","schema_version":1,"data":{"enabled":true,"center":[0.0,0.0,0.0],"shape":{"shape":"box","size":[12.0,0.2,12.0]}}},{"type_id":"quasar.rigid_body","schema_version":1,"data":{"enabled":true,"kind":"static","mass":1.0,"linear_damping":0.0}}]},
+      {"id":"02994800-0000-4000-8000-000000000004","name":"Wall","parent_id":null,"local_transform":{"translation":[0.0,1.5,-3.0],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.collider","schema_version":1,"data":{"enabled":true,"center":[0.0,0.0,0.0],"shape":{"shape":"box","size":[6.0,3.0,0.2]}}},{"type_id":"quasar.rigid_body","schema_version":1,"data":{"enabled":true,"kind":"static","mass":1.0,"linear_damping":0.0}}]},
+      {"id":"02994800-0000-4000-8000-000000000005","name":"Environment Audio","parent_id":null,"local_transform":{"translation":[0.0,0.0,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.audio_source","schema_version":1,"data":{"enabled":true,"asset_id":"02994800-0000-4000-8000-000000000101","volume":0.12,"looping":true,"autoplay":true,"spatial":false,"category":"music"}}]},
+      {"id":"02994800-0000-4000-8000-000000000006","name":"Decorative Prop","parent_id":null,"local_transform":{"translation":[-1.5,0.6,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.2,0.6]},"components":[]},
+      {"id":"02994800-0000-4000-8000-000000000007","name":"Dynamic Prop","parent_id":null,"local_transform":{"translation":[1.5,2.5,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.collider","schema_version":1,"data":{"enabled":true,"center":[0.0,0.0,0.0],"shape":{"shape":"box","size":[0.7,0.7,0.7]}}},{"type_id":"quasar.rigid_body","schema_version":1,"data":{"enabled":true,"kind":"dynamic","mass":2.0,"linear_damping":0.05}}]},
+      {"id":"02994800-0000-4000-8000-000000000008","name":"Door","parent_id":null,"local_transform":{"translation":[0.0,1.0,-2.7],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.collider","schema_version":1,"data":{"enabled":true,"center":[0.0,0.0,0.0],"shape":{"shape":"box","size":[1.0,2.0,0.12]}}},{"type_id":"quasar.rigid_body","schema_version":1,"data":{"enabled":true,"kind":"kinematic","mass":1.0,"linear_damping":0.0}},{"type_id":"quasar.door","schema_version":1,"data":{"enabled":true,"open_angle_degrees":90.0,"open_duration_seconds":0.75}},{"type_id":"quasar.script","schema_version":1,"data":{"asset_id":"02994800-0000-4000-8000-000000000103","enabled":true}}]},
+      {"id":"02994800-0000-4000-8000-000000000009","name":"Player","parent_id":null,"local_transform":{"translation":[0.0,1.0,2.2],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.character_controller","schema_version":1,"data":{"enabled":true,"camera_object":"02994800-0000-4000-8000-00000000000a","walk_speed":4.0,"jump_speed":5.0,"gravity":9.81,"radius":0.3,"height":1.8,"eye_height":1.6,"max_slope_degrees":45.0,"step_height":0.25,"ground_snap":0.12,"mouse_sensitivity":0.0025}}]},
+      {"id":"02994800-0000-4000-8000-00000000000a","name":"Player Camera","parent_id":"02994800-0000-4000-8000-000000000009","local_transform":{"translation":[0.0,1.6,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},"components":[{"type_id":"quasar.camera","schema_version":1,"data":{"enabled":true,"vertical_fov_degrees":70.0}},{"type_id":"quasar.audio_listener","schema_version":1,"data":{"enabled":true}}]}
+    ]
+  }],
+  "audio":{"master":1.0,"music":1.0,"sfx":1.0}
+}
+

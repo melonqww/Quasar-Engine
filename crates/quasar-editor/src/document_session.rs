@@ -58,6 +58,7 @@ struct SessionState {
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     active_gesture: Option<ActiveGesture>,
+    play_run_id: Option<Uuid>,
 }
 
 struct HistoryEntry {
@@ -92,6 +93,7 @@ impl EditorDocumentSession {
                 undo: Vec::new(),
                 redo: Vec::new(),
                 active_gesture: None,
+                play_run_id: None,
             })),
         })
     }
@@ -114,6 +116,7 @@ impl EditorDocumentSession {
             .write()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         if state.active_gesture.is_some() {
             return Err(
                 "finish or cancel the active transform gesture before another command".to_owned(),
@@ -165,6 +168,7 @@ impl EditorDocumentSession {
             .read()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         if state.active_gesture.is_some() {
             return Err(
                 "finish or cancel the active transform gesture before previewing a command"
@@ -193,6 +197,7 @@ impl EditorDocumentSession {
             .write()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         if state.active_gesture.is_some() {
             return Err("a transform gesture is already active".to_owned());
         }
@@ -220,6 +225,7 @@ impl EditorDocumentSession {
             .write()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         let scene_id = command.scene_id();
         let gesture = state
             .active_gesture
@@ -337,6 +343,7 @@ impl EditorDocumentSession {
             .write()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         ensure_no_active_gesture(&state)?;
         let entry = state
             .undo
@@ -361,6 +368,7 @@ impl EditorDocumentSession {
             .write()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         ensure_no_active_gesture(&state)?;
         let entry = state
             .redo
@@ -386,10 +394,54 @@ impl EditorDocumentSession {
             .write()
             .map_err(|_| "Editor document session is unavailable".to_owned())?;
         check_revision(&state, expected_revision)?;
+        ensure_not_playing(&state)?;
         ensure_no_active_gesture(&state)?;
         state.document.save(&state.path)?;
         state.saved_document = state.document.clone();
         Ok(snapshot_of(&state))
+    }
+
+    pub(crate) fn begin_play(&self, run_id: Uuid) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "Editor document session is unavailable".to_owned())?;
+        if state.play_run_id.is_some() {
+            return Err("a Play session is already active".to_owned());
+        }
+        if state.active_gesture.is_some() {
+            return Err("finish or cancel the active edit gesture before starting Play".to_owned());
+        }
+        state.play_run_id = Some(run_id);
+        Ok(())
+    }
+
+    pub(crate) fn end_play(&self, run_id: Uuid) {
+        if let Ok(mut state) = self.state.write()
+            && state.play_run_id == Some(run_id)
+        {
+            state.play_run_id = None;
+        }
+    }
+
+    pub(crate) fn with_project_write<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let state = self
+            .state
+            .write()
+            .map_err(|_| "Editor document session is unavailable".to_owned())?;
+        ensure_not_playing(&state)?;
+        action()
+    }
+}
+
+fn ensure_not_playing(state: &SessionState) -> Result<(), String> {
+    if state.play_run_id.is_some() {
+        Err("project editing is locked while Play is running".to_owned())
+    } else {
+        Ok(())
     }
 }
 

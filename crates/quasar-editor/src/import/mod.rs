@@ -509,6 +509,7 @@ fn supported_kind(path: &Path) -> Result<AssetKind, String> {
         "glb" => Ok(AssetKind::Model),
         "png" | "jpg" | "jpeg" => Ok(AssetKind::Texture),
         "wav" => Ok(AssetKind::Audio),
+        "lua" => Ok(AssetKind::Script),
         extension => Err(format!("unsupported asset extension '.{extension}'")),
     }
 }
@@ -529,7 +530,12 @@ fn validate_source(path: &Path, kind: AssetKind) -> Result<(), String> {
     match kind {
         AssetKind::Model => validate_glb(&bytes),
         AssetKind::Texture => validate_texture(path, &bytes),
-        AssetKind::Audio => validate_wav(&bytes),
+        AssetKind::Audio => quasar_project::assets::validate_wav(&bytes),
+        AssetKind::Script => {
+            let source = std::str::from_utf8(&bytes)
+                .map_err(|error| format!("Lua source is not valid UTF-8: {error}"))?;
+            quasar_runtime::gameplay::validate_project_script(&path.display().to_string(), source)
+        }
     }
 }
 
@@ -724,38 +730,6 @@ fn jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     Err("JPEG dimensions could not be read".to_owned())
 }
 
-fn validate_wav(bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err("WAV file has an invalid RIFF/WAVE header".to_owned());
-    }
-    let declared_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8;
-    if declared_length > bytes.len() || declared_length < 12 {
-        return Err("WAV declared length exceeds the file size".to_owned());
-    }
-    let mut offset = 12usize;
-    let mut has_format = false;
-    let mut has_data = false;
-    while offset + 8 <= declared_length {
-        let chunk_length =
-            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        let chunk_start = offset + 8;
-        let chunk_end = chunk_start
-            .checked_add(chunk_length)
-            .filter(|end| *end <= declared_length)
-            .ok_or_else(|| "WAV chunk extends beyond the declared file length".to_owned())?;
-        match &bytes[offset..offset + 4] {
-            b"fmt " if chunk_length >= 16 => has_format = true,
-            b"data" if chunk_length > 0 => has_data = true,
-            _ => {}
-        }
-        offset = chunk_end + (chunk_length & 1);
-    }
-    if offset != declared_length || !has_format || !has_data {
-        return Err("WAV must contain complete format and audio data chunks".to_owned());
-    }
-    Ok(())
-}
-
 fn unique_destination(
     directory: &Path,
     original_name: &std::ffi::OsStr,
@@ -789,6 +763,7 @@ fn importer_id(kind: AssetKind) -> &'static str {
         AssetKind::Model => "quasar.gltf.glb",
         AssetKind::Texture => "quasar.image",
         AssetKind::Audio => "quasar.audio.wav",
+        AssetKind::Script => "quasar.lua",
     }
 }
 
@@ -999,6 +974,43 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn project_lua_import_checks_utf8_and_syntax_without_execution() {
+        let project = TestProject::new("lua-import");
+        let cancelled = not_cancelled();
+        let valid = project.root().join("door.lua");
+        fs::write(
+            &valid,
+            "error('this top-level code must not run during import')\nfunction on_interact() end",
+        )
+        .unwrap();
+        let asset =
+            import_local_asset_cancellable(project.root(), &valid, None, &cancelled, |_| {})
+                .expect("syntactically valid Lua is imported without running");
+        assert_eq!(asset.metadata.kind, AssetKind::Script);
+        assert_eq!(asset.metadata.importer_id, "quasar.lua");
+
+        let invalid = project.root().join("broken.lua");
+        fs::write(&invalid, "function on_interact(\n").unwrap();
+        let error =
+            import_local_asset_cancellable(project.root(), &invalid, None, &cancelled, |_| {})
+                .expect_err("invalid Lua is rejected before publish");
+        assert!(
+            error.contains("broken.lua") && error.contains("syntax"),
+            "{error}"
+        );
+
+        let invalid_utf8 = project.root().join("encoding.lua");
+        fs::write(&invalid_utf8, [0xFF, 0xFE]).unwrap();
+        let error =
+            import_local_asset_cancellable(project.root(), &invalid_utf8, None, &cancelled, |_| {})
+                .expect_err("invalid UTF-8 is rejected");
+        assert!(error.contains("UTF-8"), "{error}");
+        let catalog = quasar_project::assets::AssetCatalog::scan(project.root());
+        assert_eq!(catalog.assets.len(), 1);
+        assert_eq!(catalog.assets[0].metadata.asset_id, asset.metadata.asset_id);
     }
 
     #[test]

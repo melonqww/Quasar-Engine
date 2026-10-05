@@ -3,6 +3,7 @@
 pub mod animation;
 pub mod gameplay;
 pub mod physics;
+pub mod project_scene;
 
 use bevy::{
     asset::AssetPlugin,

@@ -4934,6 +4934,7 @@ dependencies = [
  "mlua",
  "quasar-project",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

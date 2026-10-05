@@ -142,7 +142,7 @@ fn tools_list() -> Value {
                 "description": "Validate a scene command on a private candidate and return its result without changing the open project.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "command": { "type": "object", "description": "SceneCommand tagged object, such as {kind: set_transform, scene_id, object_id, transform}." } },
+                    "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "command": { "type": "object", "description": "SceneCommand tagged object, such as set_transform or set_component. A set_component command carries a versioned component envelope; supported gameplay type IDs include quasar.camera, quasar.character_controller, quasar.collider, quasar.rigid_body, quasar.audio_source and quasar.audio_listener." } },
                     "required": ["expected_revision", "command"],
                     "additionalProperties": false
                 }
@@ -152,7 +152,7 @@ fn tools_list() -> Value {
                 "description": "Apply one validated scene command to the open project. Use the current expected_revision; stale edits are rejected.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "command": { "type": "object", "description": "SceneCommand tagged object." } },
+                    "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "command": { "type": "object", "description": "Validated SceneCommand tagged object, including set_component and remove_component for versioned gameplay components. Changes use the Editor's shared validation and Undo/Redo history." } },
                     "required": ["expected_revision", "command"],
                     "additionalProperties": false
                 }
@@ -206,6 +206,36 @@ fn tools_list() -> Value {
                 "name": "assign_model_asset",
                 "description": "Assign a ready model asset to an object or clear its model assignment. The change is undoable and requires the current revision.",
                 "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "scene_id": { "type": "string", "format": "uuid" }, "object_id": { "type": "string", "format": "uuid" }, "asset_id": { "type": ["string", "null"], "format": "uuid" } }, "required": ["expected_revision", "scene_id", "object_id", "asset_id"], "additionalProperties": false }
+            },
+            {
+                "name": "assign_script_asset",
+                "description": "Assign a ready project Lua script asset to an object or clear the assignment. The change is undoable and requires the current revision.",
+                "inputSchema": { "type": "object", "properties": { "expected_revision": { "type": "integer", "minimum": 0 }, "scene_id": { "type": "string", "format": "uuid" }, "object_id": { "type": "string", "format": "uuid" }, "asset_id": { "type": ["string", "null"], "format": "uuid" } }, "required": ["expected_revision", "scene_id", "object_id", "asset_id"], "additionalProperties": false }
+            },
+            {
+                "name": "read_project_script",
+                "description": "Read a ready Lua script asset and its content revision from the open project.",
+                "inputSchema": { "type": "object", "properties": { "asset_id": { "type": "string", "format": "uuid" } }, "required": ["asset_id"], "additionalProperties": false }
+            },
+            {
+                "name": "write_project_script",
+                "description": "Validate and save a project Lua script if its content revision still matches expected_revision.",
+                "inputSchema": { "type": "object", "properties": { "asset_id": { "type": "string", "format": "uuid" }, "expected_revision": { "type": "integer", "minimum": 0 }, "source": { "type": "string", "maxLength": 65536 } }, "required": ["asset_id", "expected_revision", "source"], "additionalProperties": false }
+            },
+            {
+                "name": "play_status",
+                "description": "Read the Editor Play/Stop process state for the open project.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            },
+            {
+                "name": "play_start",
+                "description": "Build an immutable snapshot of the current project and launch it in the standalone Player.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            },
+            {
+                "name": "play_stop",
+                "description": "Stop the Player process started by this Editor session.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
             }
         ]
     })
@@ -237,7 +267,13 @@ fn call_tool(request: &Value, manifest_path: &PathBuf) -> Result<Value, (i64, St
         | "start_asset_reimport"
         | "get_asset_job"
         | "cancel_asset_job"
-        | "assign_model_asset" => query_editor(manifest_path, name, &arguments),
+        | "assign_model_asset"
+        | "assign_script_asset"
+        | "read_project_script"
+        | "write_project_script"
+        | "play_status"
+        | "play_start"
+        | "play_stop" => query_editor(manifest_path, name, &arguments),
         "get_scene" => {
             let scene_id = arguments
                 .get("scene_id")

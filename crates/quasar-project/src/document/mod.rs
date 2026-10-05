@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{persistence, validation};
+use crate::{gameplay::ProjectAudioSettings, persistence, validation};
 
 pub const PROJECT_DOCUMENT_VERSION: u32 = 1;
 pub const SCENE_DOCUMENT_VERSION: u32 = 1;
@@ -45,6 +45,13 @@ pub struct ProjectDocument {
     pub name: String,
     pub active_scene_id: SceneId,
     pub scenes: Vec<SceneDocument>,
+    /// Project-wide authoring settings; absent in older version-1 documents means defaults.
+    #[serde(default, skip_serializing_if = "is_default_audio_settings")]
+    pub audio: ProjectAudioSettings,
+}
+
+fn is_default_audio_settings(settings: &ProjectAudioSettings) -> bool {
+    *settings == ProjectAudioSettings::default()
 }
 
 impl ProjectDocument {
@@ -56,6 +63,7 @@ impl ProjectDocument {
             name: name.into(),
             active_scene_id,
             scenes: vec![scene],
+            audio: ProjectAudioSettings::default(),
         }
     }
 

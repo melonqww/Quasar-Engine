@@ -2,9 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::assets::{AssetId, MODEL_COMPONENT_TYPE_ID, ModelAssetComponent};
+use crate::assets::{
+    AssetId, MODEL_COMPONENT_TYPE_ID, ModelAssetComponent, SCRIPT_COMPONENT_TYPE_ID,
+    ScriptComponent,
+};
 use crate::document::{
-    ObjectId, ProjectDocument, SceneDocument, SceneId, SceneObjectDocument, TransformDocument,
+    ComponentDocument, ObjectId, ProjectDocument, SceneDocument, SceneId, SceneObjectDocument,
+    TransformDocument,
 };
 
 /// A user-level scene edit. UI gestures and MCP tools map to these same commands.
@@ -39,6 +43,21 @@ pub enum SceneCommand {
         object_id: ObjectId,
         asset_id: Option<AssetId>,
     },
+    AssignScriptAsset {
+        scene_id: SceneId,
+        object_id: ObjectId,
+        asset_id: Option<AssetId>,
+    },
+    SetComponent {
+        scene_id: SceneId,
+        object_id: ObjectId,
+        component: ComponentDocument,
+    },
+    RemoveComponent {
+        scene_id: SceneId,
+        object_id: ObjectId,
+        type_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +75,10 @@ impl SceneCommand {
             | Self::RenameObject { scene_id, .. }
             | Self::SetTransform { scene_id, .. }
             | Self::ReparentObject { scene_id, .. }
-            | Self::AssignModelAsset { scene_id, .. } => *scene_id,
+            | Self::AssignModelAsset { scene_id, .. }
+            | Self::AssignScriptAsset { scene_id, .. }
+            | Self::SetComponent { scene_id, .. }
+            | Self::RemoveComponent { scene_id, .. } => *scene_id,
         }
     }
 
@@ -68,6 +90,9 @@ impl SceneCommand {
             Self::SetTransform { .. } => "Set Transform",
             Self::ReparentObject { .. } => "Reparent Object",
             Self::AssignModelAsset { .. } => "Assign Model Asset",
+            Self::AssignScriptAsset { .. } => "Assign Script Asset",
+            Self::SetComponent { .. } => "Set Component",
+            Self::RemoveComponent { .. } => "Remove Component",
         }
     }
 
@@ -139,6 +164,67 @@ impl SceneCommand {
                         }
                         .into_component(),
                     );
+                }
+                vec![*object_id]
+            }
+            Self::AssignScriptAsset {
+                object_id,
+                asset_id,
+                ..
+            } => {
+                let object = find_object_mut(scene, *object_id)?;
+                object
+                    .components
+                    .retain(|component| component.type_id != SCRIPT_COMPONENT_TYPE_ID);
+                if let Some(asset_id) = asset_id {
+                    object.components.push(
+                        ScriptComponent {
+                            asset_id: *asset_id,
+                            enabled: true,
+                        }
+                        .into_component(),
+                    );
+                }
+                vec![*object_id]
+            }
+            Self::SetComponent {
+                object_id,
+                component,
+                ..
+            } => {
+                if component.type_id.trim().is_empty() || component.schema_version == 0 {
+                    return Err(
+                        "component requires a non-empty type_id and non-zero schema_version".into(),
+                    );
+                }
+                let object = find_object_mut(scene, *object_id)?;
+                if let Some(existing) = object
+                    .components
+                    .iter_mut()
+                    .find(|existing| existing.type_id == component.type_id)
+                {
+                    *existing = component.clone();
+                } else {
+                    object.components.push(component.clone());
+                }
+                vec![*object_id]
+            }
+            Self::RemoveComponent {
+                object_id, type_id, ..
+            } => {
+                if type_id.trim().is_empty() {
+                    return Err("component type_id cannot be empty".into());
+                }
+                let object = find_object_mut(scene, *object_id)?;
+                let original_len = object.components.len();
+                object
+                    .components
+                    .retain(|component| component.type_id != *type_id);
+                if object.components.len() == original_len {
+                    return Err(format!(
+                        "object '{}' has no component '{}'",
+                        object_id.0, type_id
+                    ));
                 }
                 vec![*object_id]
             }
