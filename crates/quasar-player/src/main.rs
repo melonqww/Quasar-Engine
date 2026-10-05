@@ -637,7 +637,7 @@ fn setup_document_preview(
         {
             let is_player_camera = active_controller.is_some();
             if is_player_camera && let Some((_, controller)) = active_controller {
-                transform.translation.y = controller.eye_height;
+                transform.translation.y = controller_camera_local_height(&controller);
                 commands.entity(entity).insert(PlayerCameraSettings {
                     sensitivity: controller.mouse_sensitivity,
                     pitch: 0.0,
@@ -795,6 +795,10 @@ fn document_door_rotation(door: &DoorMotion, progress: f32) -> Quat {
     let progress = progress.clamp(0.0, 1.0);
     let eased = progress * progress * (3.0 - 2.0 * progress);
     door.closed_rotation * Quat::from_rotation_y(door.open_angle_radians * eased)
+}
+
+fn controller_camera_local_height(controller: &CharacterControllerComponent) -> f32 {
+    controller.eye_height - controller.height * 0.5
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1571,9 +1575,9 @@ mod tests {
 
     use super::{
         DoorMotion, PlayerDoor, PlayerSessionAudio, PlayerSessionState, active_document_scene,
-        benchmark_route_direction, document_door_rotation, enabled_kinematic_doors,
-        handle_session_audio_input, interact_with_door, parse_screenshot_argument,
-        parse_snapshot_argument, percentile, read_player_input,
+        benchmark_route_direction, controller_camera_local_height, document_door_rotation,
+        enabled_kinematic_doors, handle_session_audio_input, interact_with_door,
+        parse_screenshot_argument, parse_snapshot_argument, percentile, read_player_input,
         resolve_project_document_with_asset_root, resolve_snapshot, validate_document_model_assets,
     };
     use bevy::{
@@ -1745,6 +1749,16 @@ mod tests {
                 .is_some_and(|source| source.enabled && source.autoplay && source.looping)
         }));
         assert_eq!(document.asset_catalog.assets.len(), 3);
+    }
+
+    #[test]
+    fn first_person_camera_eye_height_is_relative_to_capsule_center() {
+        let controller =
+            CharacterControllerComponent::new(quasar_project::document::ObjectId::new());
+        let local_height = controller_camera_local_height(&controller);
+
+        assert!((local_height - 0.7).abs() < 1.0e-6);
+        assert!((local_height + controller.height * 0.5 - controller.eye_height).abs() < 1.0e-6);
     }
 
     #[test]
